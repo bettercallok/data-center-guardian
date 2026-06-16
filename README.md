@@ -50,24 +50,22 @@ by predicting the time-to-failure (TTF), data center operators can perform proac
 
 ```mermaid
 graph TD
-    A[contract submission] -->|detect network & fetch| B(etherscan API)
-    B -->|save source & queue| C[celery orchestration queue]
+    A[user inputs SMART metrics] -->|HTTP POST JSON| B(FastAPI Backend)
+    B -->|load telemetry| C[XGBoost survival model]
+    C -->|calculate time-to-failure| B
+    B -->|return RUL prediction| D[Vercel React Frontend]
     
-    C -->|fast AST analysis| D[slither engine]
-    C -->|deep symbolic exec| E[mythril engine]
-    C -->|gas optimization| G_ENG[gas analyzer]
-    C -->|fork & simulate| F[tenderly API]
+    E[GitHub Actions Cron Job] -->|quarterly trigger| F[ETL pipeline: pipeline.py]
+    F -->|scrape HDD data| G(Backblaze Servers)
+    F -->|compress with Polars| H[(Parquet Data Store)]
     
-    D -->|extract AST & vulns| G[RAG context builder]
-    E -->|extract logic flaws| G
-    G_ENG -->|extract gas waste| G
+    H -->|continuous training| I[train_survival.py]
+    I -->|train survival:aft objective| J[XGBoost Engine]
+    I -->|export model| K[survival_model.json]
     
-    G -->|query knowledge base| H[(chromaDB vector store)]
-    H -->|inject SWC context| I[ollama local LLM]
-    
-    I -->|generate human-readable report| J[(postgresql DB)]
-    J -->|real-time websocket| K[react + vite frontend]
-    J -->|export| L[weasyprint PDF generator]
+    K -->|commit to main branch| L[GitHub Repository]
+    L -->|hot-swap / trigger redeploy| M(Hugging Face Spaces)
+    M -.->|hosts| B
 ```
 
 the platform is split into three distinct, highly decoupled operational domains.
