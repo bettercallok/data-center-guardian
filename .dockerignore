@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+
+# Node
+# frontend environment files — Docker must NEVER bake in a hardcoded API URL.
+# The build falls back to '' (relative URLs) which works for any single-container deployment.
+frontend/.env
+frontend/.env.local
+frontend/.env.production
+frontend/.env.production.local
+frontend/.env.development
+frontend/.env.development.local
+frontend/node_modules/
+frontend/dist/
+
+# Data — raw and large CSV files are not needed in Docker
+data/raw/
+compiled_smart_data.csv
+
+# Dev & test artifacts
+.env
+*.db
+tests/
+demo/
+extract_columns.py
+src/ml/colab_training.ipynb
+
+# Git
+.git/
+.github/
+
+# IDE
+.vscode/
+.idea/
