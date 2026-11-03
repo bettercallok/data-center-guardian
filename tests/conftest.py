@@ -1,47 +1,35 @@
 """
 tests/conftest.py — Shared pytest fixtures
 
-Uses an in-memory SQLite database so tests run without Docker or Postgres.
+Environment is configured *before* the app is imported so settings pick it up:
+  - an in-memory SQLite database (shared StaticPool connection)
+  - a known admin API key
+  - rate limiting disabled (tests hammer endpoints far faster than any limit)
 """
-import pytest
-import numpy as np
-import xgboost as xgb
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+import os
 
-from src.database.models import Base
-from src.database.connection import get_db
-from src.api.main import app
+os.environ["DATABASE_URL"] = "sqlite://"
+os.environ["GUARDIAN_ADMIN_API_KEY"] = "test-admin-key"
+os.environ["RATE_LIMIT_ENABLED"] = "false"
+os.environ.setdefault("PROBE_SAMPLES", "300")
 
-# In-memory SQLite — fast, no disk I/O
-TEST_DB_URL = "sqlite:///:memory:"
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 
-test_engine = create_engine(TEST_DB_URL, connect_args={"check_same_thread": False})
-TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+from src.api.main import app  # noqa: E402
 
-
-def override_get_db():
-    db = TestSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-@pytest.fixture(scope="session", autouse=True)
-def setup_test_db():
-    Base.metadata.create_all(bind=test_engine)
-    yield
-    Base.metadata.drop_all(bind=test_engine)
+ADMIN_KEY = os.environ["GUARDIAN_ADMIN_API_KEY"]
 
 
 @pytest.fixture(scope="session")
 def client():
-    app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as c:
         yield c
-    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def admin_headers():
+    return {"X-API-Key": ADMIN_KEY}
 
 
 @pytest.fixture(scope="session")
