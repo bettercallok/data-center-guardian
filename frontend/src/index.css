@@ -120,6 +120,16 @@ body {
   box-shadow: 0 0 8px var(--risk-critical);
   animation: pulse-red 1s infinite;
 }
+.status-dot.amber { background: var(--risk-medium); box-shadow: 0 0 8px var(--risk-medium); }
+.status-dot.grey  { background: var(--text-muted); }
+
+.status-wrap { display: inline-flex; align-items: center; gap: 0.4rem; }
+.status-text {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  letter-spacing: 0.03em;
+}
 
 @keyframes pulse-green {
   0%, 100% { box-shadow: 0 0 4px var(--risk-low); }
@@ -132,6 +142,8 @@ body {
 
 /* ─── Global Alert Badge ──────────────────────────────────────────────────── */
 .global-alert-badge {
+  font-family: inherit;
+  cursor: pointer;
   font-size: 0.75rem;
   font-weight: 600;
   padding: 0.3rem 0.8rem;
@@ -284,6 +296,7 @@ body {
   transition: border-color 0.2s, box-shadow 0.2s;
   outline: none;
 }
+.input-group input:invalid { border-color: rgba(239,68,68,0.5); }
 .input-group input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(79,142,247,0.15);
@@ -292,6 +305,7 @@ body {
 /* ─── Buttons ─────────────────────────────────────────────────────────────── */
 .btn {
   border: none;
+  font-family: inherit;
   font-size: 0.82rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -320,6 +334,8 @@ body {
   padding: 0.35rem 0.8rem;
 }
 .btn-ghost:hover { border-color: var(--border-glow); color: var(--text-primary); }
+.btn-ghost.active { border-color: var(--border-glow); color: var(--accent); background: var(--accent-dim); }
+a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .btn-sm { font-size: 0.72rem; padding: 0.25rem 0.6rem; }
 
 /* ─── Badges ──────────────────────────────────────────────────────────────── */
@@ -475,4 +491,170 @@ body {
 @media (max-width: 700px) {
   .rul-distribution-row { grid-template-columns: 1fr 1fr; }
   .dashboard-container  { padding: 1rem; }
+}
+
+/* ─── Accessibility ───────────────────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.input-group input:focus-visible { outline: none; }
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0.5rem;
+  background: var(--accent);
+  color: #fff;
+  padding: 0.4rem 0.8rem;
+  border-radius: 6px;
+  z-index: 10;
+}
+.skip-link:focus { left: 0.5rem; }
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ─── Presets, admin panel, banners ───────────────────────────────────────── */
+.preset-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+.preset-row .stat-label { margin-right: 0.25rem; }
+
+.admin-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+.admin-actions { display: flex; gap: 0.5rem; }
+.admin-note { flex-basis: 100%; font-size: 0.72rem; }
+
+.offline-banner {
+  background: rgba(239,68,68,0.1);
+  border: 1px solid rgba(239,68,68,0.3);
+  color: #f87171;
+  border-radius: 8px;
+  padding: 0.6rem 1rem;
+  font-size: 0.8rem;
+  margin-bottom: 1.25rem;
+}
+
+/* ─── Card title row & segmented control ──────────────────────────────────── */
+.card-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.25rem;
+}
+.card-title-row .card-title { border-bottom: none; margin-bottom: 0; }
+
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.seg-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.25rem 0.75rem;
+  cursor: pointer;
+}
+.seg-btn.active { background: var(--accent-dim); color: var(--accent); }
+
+.alert-item.resolved { opacity: 0.6; }
+.alert-resolved-tag {
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--risk-low);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* ─── Fleet scan ──────────────────────────────────────────────────────────── */
+.fleet-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; }
+.error-list {
+  margin-top: 0.75rem;
+  padding-left: 1.1rem;
+  color: var(--risk-critical);
+  font-size: 0.75rem;
+}
+
+.risk-text-critical { color: var(--risk-critical); }
+.risk-text-high     { color: var(--risk-high); }
+.risk-text-medium   { color: var(--risk-medium); }
+.risk-text-low      { color: var(--risk-low); }
+
+.table-wrap { overflow-x: auto; }
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.data-table th {
+  text-align: left;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.data-table td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.data-table tbody tr:hover { background: var(--bg-hover); }
+.data-table .num { text-align: right; }
+.mono { font-family: 'JetBrains Mono', monospace; }
+
+/* ─── Footer ──────────────────────────────────────────────────────────────── */
+.footer {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+/* ─── Small screens ───────────────────────────────────────────────────────── */
+@media (max-width: 700px) {
+  .header-right { width: 100%; }
+  .tabs { width: 100%; overflow-x: auto; }
+  .tab-btn { white-space: nowrap; }
+  .stat-value { font-size: 1.25rem; }
+  .metric-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
 }

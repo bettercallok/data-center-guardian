@@ -1,120 +1,60 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef, type FormEvent } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  Line, ReferenceLine, Legend, AreaChart, Area
+  Line, LineChart, ReferenceLine, Legend, AreaChart, Area
 } from 'recharts';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface DriveTelemetry {
-  smart_5_raw: number;
-  smart_187_raw: number;
-  smart_188_raw: number;
-  smart_197_raw: number;
-  smart_198_raw: number;
-}
-
-interface EnrichedPrediction {
-  ttf_days: number;
-  rul_days: number;
-  risk_level: 'low' | 'medium' | 'high' | 'critical';
-  log_time: number;
-  novelty_score: number | null;
-  novelty_distance: number | null;
-  is_novel: boolean | null;
-  fired_alert_ids: string[];
-  drift_summary: unknown | null;
-}
-
-interface Alert {
-  id: string;
-  alert_type: 'LATENT_NOVELTY' | 'FEATURE_DRIFT';
-  severity: 'WARNING' | 'CRITICAL';
-  status: 'ACTIVE' | 'RESOLVED';
-  message: string;
-  metadata: Record<string, unknown>;
-  created_at: string;
-  escalation_count: number;
-}
-
-interface FeatureDriftScore {
-  feature: string;
-  ks_statistic: number;
-  ks_p_value: number;
-  psi: number;
-  severity: 'stable' | 'minor' | 'major';
-  is_drifting: boolean;
-}
-
-interface HealthData {
-  status: string;
-  total_inferences: number;
-  faiss: { is_built: boolean; threshold: number };
-  drift: {
-    overall_drift_detected: boolean;
-    drifting_features: string[];
-    window_size: number;
-    feature_scores: FeatureDriftScore[];
-  } | null;
-  alerts: {
-    total_active: number;
-    latent_novelty: number;
-    feature_drift: number;
-    critical_count: number;
-  };
-}
-
-interface Fingerprint {
-  fingerprint_id: string;
-  n_probe_samples: number;
-  rul_distribution: { mean: number; std: number; median: number; p10: number; p90: number };
-  prediction_entropy: number;
-  uncertainty_rate: number;
-  class_bias: Record<string, number>;
-  feature_importance: Record<string, number>;
-  histogram: { bins: number[]; counts: number[] };
-}
-
-
+import { API_URL, apiFetch, errorMessage, getAdminKey, setAdminKey } from './api';
+import { CSV_TEMPLATE, MAX_CSV_BYTES, downloadText, parseFleetCsv } from './csv';
+import {
+  FEATURE_LABELS, RISK_ORDER, SMART_FEATURES,
+  type Alert, type ApiMeta, type BatchPredictionResponse, type DriftSnapshot, type DriveTelemetry,
+  type EnrichedPrediction, type Fingerprint, type HealthData, type PredictionSummary,
+  type RiskLevel, type SmartFeature, type SmartValues, type Topology,
+} from './types';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-// Empty string = relative URLs (same origin). Works for any port in Docker.
-// Set VITE_API_URL at build time to point to a remote backend if needed.
-const API_URL = import.meta.env.VITE_API_URL || '';
-const FEATURE_LABELS: Record<string, string> = {
-  smart_5_raw: 'SMART 5 (Reallocated Sectors)',
-  smart_187_raw: 'SMART 187 (Uncorrectable Errors)',
-  smart_188_raw: 'SMART 188 (Command Timeout)',
-  smart_197_raw: 'SMART 197 (Pending Sectors)',
-  smart_198_raw: 'SMART 198 (Uncorrectable Sectors)',
+const POLL_MS = 5000;
+
+const PRESETS: Array<{ id: string; label: string; values: SmartValues }> = [
+  { id: 'healthy', label: 'healthy', values: { smart_5_raw: 0, smart_187_raw: 0, smart_188_raw: 0, smart_197_raw: 0, smart_198_raw: 0 } },
+  { id: 'degrading', label: 'degrading', values: { smart_5_raw: 24, smart_187_raw: 3, smart_188_raw: 0, smart_197_raw: 16, smart_198_raw: 16 } },
+  { id: 'failing', label: 'failing', values: { smart_5_raw: 320, smart_187_raw: 120, smart_188_raw: 600, smart_197_raw: 280, smart_198_raw: 280 } },
+];
+
+const TOOLTIP_STYLE = { background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6 };
+const FEATURE_COLORS = ['#4f8ef7', '#22c55e', '#f59e0b', '#f97316', '#a78bfa'];
+
+const shortFeature = (f: string) => f.replace('smart_', 'S').replace('_raw', '');
+const clampSmart = (raw: string) => {
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) ? Math.min(65535, Math.max(0, n)) : 0;
 };
 
 // ─── Sub-components ────────────────────────────────────────────────────────────
 
-const RiskBadge = ({ level }: { level: string }) => {
-  const colors: Record<string, string> = {
-    low: 'var(--risk-low)',
-    medium: 'var(--risk-medium)',
-    high: 'var(--risk-high)',
-    critical: 'var(--risk-critical)',
-  };
-  return (
-    <span className={`badge badge-${level}`} style={{ background: colors[level] }}>
-      {level}
-    </span>
-  );
-};
+const RiskBadge = ({ level }: { level: string }) => (
+  <span className={`badge badge-${level}`}>{level}</span>
+);
 
 const NoveltyIndicator = ({ score, isNovel }: { score: number | null; isNovel: boolean | null }) => {
   if (score === null) return <span className="novelty-na">—</span>;
-  const pct = Math.min(score * 100, 150);
+  // Track spans 0 → 1.5; the threshold marker sits at 1.0 (2/3 of the track).
+  const pct = Math.min(score / 1.5, 1) * 100;
   return (
     <div className="novelty-bar-wrap">
-      <div className="novelty-bar-track">
+      <div
+        className="novelty-bar-track"
+        role="meter"
+        aria-valuemin={0}
+        aria-valuemax={1.5}
+        aria-valuenow={Number(score.toFixed(2))}
+        aria-label="novelty score"
+      >
         <div
           className="novelty-bar-fill"
-          style={{ width: `${Math.min(pct, 100)}%`, background: isNovel ? 'var(--risk-critical)' : 'var(--accent-glow)' }}
+          style={{ width: `${pct}%`, background: isNovel ? 'var(--risk-critical)' : 'var(--accent-glow)' }}
         />
         <div className="novelty-threshold-line" />
       </div>
@@ -133,30 +73,26 @@ const StatCard = ({ label, value, sub }: { label: string; value: string | number
   </div>
 );
 
-// ─── Tabs ─────────────────────────────────────────────────────────────────────
+// ─── Inference Tab ────────────────────────────────────────────────────────────
 
 const InferenceTab = () => {
-  const [telemetry, setTelemetry] = useState<DriveTelemetry>({
-    smart_5_raw: 12, smart_187_raw: 2, smart_188_raw: 0, smart_197_raw: 8, smart_198_raw: 8,
-  });
+  const [telemetry, setTelemetry] = useState<SmartValues>(PRESETS[1].values);
+  const [serial, setSerial] = useState('');
   const [prediction, setPrediction] = useState<EnrichedPrediction | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [history, setHistory] = useState<Array<EnrichedPrediction & { id: number }>>([]);
+  const [history, setHistory] = useState<Array<EnrichedPrediction & { key: number }>>([]);
 
-  const runPrediction = async () => {
+  const runPrediction = async (e: FormEvent) => {
+    e.preventDefault();
     setLoading(true); setError('');
     try {
-      const res = await fetch(`${API_URL}/api/models/predict`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(telemetry),
-      });
-      if (!res.ok) throw new Error(`API Error ${res.status}`);
-      const data: EnrichedPrediction = await res.json();
+      const body: DriveTelemetry = { ...telemetry, ...(serial.trim() ? { serial_number: serial.trim() } : {}) };
+      const data = await apiFetch<EnrichedPrediction>('/api/models/predict', { method: 'POST', body });
       setPrediction(data);
-      setHistory(h => [{ ...data, id: Date.now() }, ...h].slice(0, 30));
-    } catch (e) {
-      setError('failed to connect to inference server.');
+      setHistory(h => [{ ...data, key: Date.now() }, ...h].slice(0, 30));
+    } catch (err) {
+      setError(errorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -166,38 +102,54 @@ const InferenceTab = () => {
     i: i + 1,
     rul: p.rul_days,
     novelty: p.novelty_score ?? 0,
-    risk: p.risk_level,
   }));
 
   return (
     <div className="tab-content stagger-enter">
       <div className="two-col">
         {/* Left: Inputs */}
-        <div className="card">
+        <form className="card" onSubmit={runPrediction}>
           <h2 className="card-title">smart telemetry inputs</h2>
-          {Object.keys(telemetry).map(key => (
+          <div className="preset-row" role="group" aria-label="telemetry presets">
+            <span className="stat-label">presets</span>
+            {PRESETS.map(p => (
+              <button type="button" key={p.id} className="btn btn-ghost btn-sm" onClick={() => setTelemetry(p.values)}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+          <div className="input-group">
+            <label htmlFor="serial_number">serial number (optional)</label>
+            <input
+              id="serial_number" type="text" maxLength={64} placeholder="e.g. ZA1234XY"
+              value={serial} onChange={e => setSerial(e.target.value)}
+              pattern="[A-Za-z0-9][A-Za-z0-9 ._\-/]{0,63}"
+              title="letters, digits, space, . _ - /"
+            />
+          </div>
+          {SMART_FEATURES.map((key: SmartFeature) => (
             <div className="input-group" key={key}>
-              <label>{FEATURE_LABELS[key] || key}</label>
+              <label htmlFor={key}>{FEATURE_LABELS[key]}</label>
               <input
-                type="number" min={0} max={65535}
-                value={telemetry[key as keyof DriveTelemetry]}
-                onChange={e => setTelemetry({ ...telemetry, [key]: Number(e.target.value) })}
+                id={key} type="number" min={0} max={65535} step={1} inputMode="numeric"
+                value={telemetry[key]}
+                onChange={e => setTelemetry(t => ({ ...t, [key]: clampSmart(e.target.value) }))}
               />
             </div>
           ))}
-          <button className="btn btn-primary" onClick={runPrediction} disabled={loading}>
+          <button type="submit" className="btn btn-primary" disabled={loading}>
             {loading ? 'running inference...' : 'run prediction'}
           </button>
-          {error && <p className="error-msg">{error}</p>}
-        </div>
+          {error && <p className="error-msg" role="alert">{error}</p>}
+        </form>
 
         {/* Right: Results */}
-        <div className="card">
+        <div className="card" aria-live="polite">
           <h2 className="card-title">prediction results</h2>
           {prediction ? (
             <>
               <div className="metric-grid" style={{ marginBottom: '1.5rem' }}>
-                <StatCard label="remaining useful life" value={`${prediction.rul_days}d`} />
+                <StatCard label="remaining useful life" value={`${prediction.rul_days}d`} sub="ttf minus 30d maintenance buffer" />
                 <StatCard label="time to failure" value={`${prediction.ttf_days}d`} />
                 <div className="stat-card">
                   <span className="stat-label">risk level</span>
@@ -208,10 +160,15 @@ const InferenceTab = () => {
               <div style={{ marginBottom: '1rem' }}>
                 <span className="stat-label">latent space novelty</span>
                 <NoveltyIndicator score={prediction.novelty_score} isNovel={prediction.is_novel} />
+                {prediction.out_of_range_features.length > 0 && (
+                  <p className="muted" style={{ marginTop: '0.4rem' }}>
+                    outside probed operating range: {prediction.out_of_range_features.map(shortFeature).join(', ')}
+                  </p>
+                )}
               </div>
               {prediction.fired_alert_ids.length > 0 && (
-                <div className="alert-banner">
-                  ⚠ {prediction.fired_alert_ids.length} alert(s) fired
+                <div className="alert-banner" role="status">
+                  ⚠ {prediction.fired_alert_ids.length} alert(s) fired — see monitoring
                 </div>
               )}
             </>
@@ -235,14 +192,12 @@ const InferenceTab = () => {
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
               <XAxis dataKey="i" stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-              <YAxis stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-              <Tooltip
-                contentStyle={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6 }}
-                labelStyle={{ color: 'var(--text-muted)' }}
-              />
-              <Area type="monotone" dataKey="rul" stroke="var(--accent)" fill="url(#rulGrad)" name="RUL (days)" dot={false} />
-              <Line type="monotone" dataKey="novelty" stroke="var(--risk-high)" dot={false} name="novelty score" strokeDasharray="4 2" />
-              <ReferenceLine y={1} stroke="var(--risk-critical)" strokeDasharray="6 3" label={{ value: 'novelty threshold', fill: 'var(--risk-critical)', fontSize: 10 }} />
+              <YAxis yAxisId="rul" stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
+              <YAxis yAxisId="nov" orientation="right" stroke="var(--text-muted)" tick={{ fontSize: 11 }} domain={[0, 'auto']} />
+              <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={{ color: 'var(--text-muted)' }} />
+              <Area yAxisId="rul" type="monotone" dataKey="rul" stroke="var(--accent)" fill="url(#rulGrad)" name="RUL (days)" dot={false} />
+              <Line yAxisId="nov" type="monotone" dataKey="novelty" stroke="var(--risk-high)" dot={false} name="novelty score" strokeDasharray="4 2" />
+              <ReferenceLine yAxisId="nov" y={1} stroke="var(--risk-critical)" strokeDasharray="6 3" label={{ value: 'novelty threshold', fill: 'var(--risk-critical)', fontSize: 10 }} />
               <Legend wrapperStyle={{ color: 'var(--text-muted)', fontSize: 12 }} />
             </AreaChart>
           </ResponsiveContainer>
@@ -252,19 +207,182 @@ const InferenceTab = () => {
   );
 };
 
+// ─── Fleet Scan Tab (batch CSV) ───────────────────────────────────────────────
 
-const MonitoringTab = ({ health, alerts, onResolve }: {
+type FleetRow = EnrichedPrediction & { drive_model?: string; row: number };
+
+const FleetTab = ({ maxBatch }: { maxBatch: number }) => {
+  const [drives, setDrives] = useState<DriveTelemetry[]>([]);
+  const [parseErrors, setParseErrors] = useState<string[]>([]);
+  const [fileName, setFileName] = useState('');
+  const [results, setResults] = useState<FleetRow[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  const onFile = async (file: File | undefined) => {
+    setResults([]); setError(''); setParseErrors([]); setDrives([]);
+    if (!file) return;
+    setFileName(file.name);
+    if (file.size > MAX_CSV_BYTES) {
+      setParseErrors([`file is larger than ${MAX_CSV_BYTES / 1024} KB.`]);
+      return;
+    }
+    const parsed = parseFleetCsv(await file.text());
+    setDrives(parsed.drives);
+    setParseErrors(parsed.errors);
+  };
+
+  const runScan = async () => {
+    setLoading(true); setError(''); setResults([]);
+    try {
+      const out: FleetRow[] = [];
+      for (let start = 0; start < drives.length; start += maxBatch) {
+        const chunk = drives.slice(start, start + maxBatch);
+        const res = await apiFetch<BatchPredictionResponse>('/api/models/predict/batch', {
+          method: 'POST', body: { drives: chunk },
+        });
+        res.predictions.forEach((p, i) => out.push({ ...p, drive_model: chunk[i].drive_model, row: start + i + 1 }));
+      }
+      out.sort((a, b) => RISK_ORDER[a.risk_level] - RISK_ORDER[b.risk_level] || a.rul_days - b.rul_days);
+      setResults(out);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const counts = results.reduce<Record<RiskLevel, number>>(
+    (acc, r) => ({ ...acc, [r.risk_level]: acc[r.risk_level] + 1 }),
+    { critical: 0, high: 0, medium: 0, low: 0 },
+  );
+
+  const exportResults = () => {
+    const header = 'row,serial_number,drive_model,risk_level,rul_days,ttf_days,novelty_score,is_novel';
+    const esc = (v: unknown) => {
+      const s = v === null || v === undefined ? '' : String(v);
+      return /^[=+\-@\t\r]/.test(s) && Number.isNaN(Number(s)) ? `'${s}` : s;
+    };
+    const lines = results.map(r =>
+      [r.row, r.serial_number, r.drive_model, r.risk_level, r.rul_days, r.ttf_days, r.novelty_score, r.is_novel].map(esc).join(','),
+    );
+    downloadText('fleet_scan_results.csv', [header, ...lines].join('\n') + '\n');
+  };
+
+  return (
+    <div className="tab-content stagger-enter">
+      <div className="card">
+        <h2 className="card-title">fleet scan — batch csv upload</h2>
+        <p className="muted" style={{ marginBottom: '1rem' }}>
+          Upload a CSV of drives (columns: serial_number, drive_model and the five SMART attributes) to score
+          the whole fleet at once. Results are sorted by urgency. Files are parsed in your browser; up to 1,000 rows.
+        </p>
+        <div className="fleet-actions">
+          <input
+            ref={fileInput} id="fleet-csv" type="file" accept=".csv,text/csv" className="visually-hidden"
+            onChange={e => void onFile(e.target.files?.[0])}
+          />
+          <button type="button" className="btn btn-ghost" onClick={() => fileInput.current?.click()}>
+            {fileName ? `📄 ${fileName}` : 'choose csv file'}
+          </button>
+          <button type="button" className="btn btn-ghost" onClick={() => downloadText('fleet_template.csv', CSV_TEMPLATE)}>
+            download template
+          </button>
+          <a className="btn btn-ghost" href={`${API_URL}/api/models/predictions/export`} download>
+            export prediction history
+          </a>
+          <button type="button" className="btn btn-primary" style={{ marginTop: 0 }} disabled={!drives.length || loading} onClick={runScan}>
+            {loading ? 'scanning...' : drives.length ? `scan ${drives.length} drive${drives.length > 1 ? 's' : ''}` : 'scan fleet'}
+          </button>
+        </div>
+        {parseErrors.length > 0 && (
+          <ul className="error-list" role="alert">
+            {parseErrors.map(e => <li key={e}>{e}</li>)}
+          </ul>
+        )}
+        {error && <p className="error-msg" role="alert">{error}</p>}
+      </div>
+
+      {results.length > 0 && (
+        <>
+          <div className="metric-grid">
+            {(['critical', 'high', 'medium', 'low'] as RiskLevel[]).map(tier => (
+              <div className="stat-card" key={tier}>
+                <span className="stat-label">{tier} risk</span>
+                <span className={`stat-value risk-text-${tier}`}>{counts[tier]}</span>
+              </div>
+            ))}
+            <StatCard label="novel inputs" value={results.filter(r => r.is_novel).length} sub="outside training distribution" />
+          </div>
+          <div className="card">
+            <div className="card-title-row">
+              <h2 className="card-title">scan results ({results.length})</h2>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={exportResults}>download results</button>
+            </div>
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th scope="col">row</th><th scope="col">serial</th><th scope="col">model</th>
+                    <th scope="col">risk</th><th scope="col" className="num">rul</th>
+                    <th scope="col" className="num">ttf</th><th scope="col" className="num">novelty</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {results.map(r => (
+                    <tr key={r.row}>
+                      <td className="mono">{r.row}</td>
+                      <td className="mono">{r.serial_number ?? '—'}</td>
+                      <td>{r.drive_model ?? '—'}</td>
+                      <td><RiskBadge level={r.risk_level} /></td>
+                      <td className="num mono">{r.rul_days}d</td>
+                      <td className="num mono">{r.ttf_days}d</td>
+                      <td className={`num mono ${r.is_novel ? 'risk-text-critical' : ''}`}>
+                        {r.novelty_score === null ? '—' : r.novelty_score.toFixed(2)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// ─── Monitoring Tab ───────────────────────────────────────────────────────────
+
+const MonitoringTab = ({ health, alerts, summary, driftHistory, alertFilter, onAlertFilter, onResolve }: {
   health: HealthData | null;
   alerts: Alert[];
-  onResolve: (id: string) => void;
+  summary: PredictionSummary | null;
+  driftHistory: DriftSnapshot[];
+  alertFilter: 'active' | 'all';
+  onAlertFilter: (f: 'active' | 'all') => void;
+  onResolve: (id: string) => Promise<string | null>;
 }) => {
+  const [resolveError, setResolveError] = useState('');
+
   const driftData = health?.drift?.feature_scores?.map(s => ({
-    name: s.feature.replace('smart_', 'S').replace('_raw', ''),
+    name: shortFeature(s.feature),
     psi: s.psi,
     ks: s.ks_statistic,
-    severity: s.severity,
   })) || [];
 
+  const trendData = driftHistory.map((snap, i) => {
+    const row: Record<string, number | string> = { i: i + 1 };
+    snap.feature_scores.forEach(fs => { row[shortFeature(fs.feature)] = fs.psi; });
+    return row;
+  });
+
+  const resolve = async (id: string) => {
+    setResolveError('');
+    const err = await onResolve(id);
+    if (err) setResolveError(err);
+  };
 
   return (
     <div className="tab-content stagger-enter">
@@ -273,10 +391,10 @@ const MonitoringTab = ({ health, alerts, onResolve }: {
         <StatCard
           label="system status"
           value={health?.status || '—'}
-          sub={health?.status === 'healthy' ? '✓ all systems nominal' : '⚠ degraded'}
+          sub={health?.status === 'healthy' ? '✓ all systems nominal' : health ? '⚠ attention needed' : 'connecting...'}
         />
-        <StatCard label="total inferences" value={health?.total_inferences || 0} />
-        <StatCard label="active alerts" value={health?.alerts?.total_active || 0} sub={`${health?.alerts?.critical_count || 0} critical`} />
+        <StatCard label="total inferences" value={health?.total_inferences ?? 0} sub="since last restart" />
+        <StatCard label="active alerts" value={health?.alerts?.total_active ?? 0} sub={`${health?.alerts?.critical_count ?? 0} critical`} />
         <StatCard
           label="faiss index"
           value={health?.faiss?.is_built ? 'built' : 'not built'}
@@ -284,8 +402,20 @@ const MonitoringTab = ({ health, alerts, onResolve }: {
         />
       </div>
 
+      {summary && summary.total_predictions > 0 && (
+        <div className="card">
+          <h2 className="card-title">prediction history (all time)</h2>
+          <div className="metric-grid" style={{ marginBottom: 0 }}>
+            <StatCard label="predictions stored" value={summary.total_predictions} />
+            <StatCard label="tracked drives" value={summary.tracked_drives} sub="with a serial number" />
+            <StatCard label="mean rul" value={summary.mean_rul_days !== null ? `${summary.mean_rul_days}d` : '—'} />
+            <StatCard label="novelty rate" value={`${(summary.novelty_rate * 100).toFixed(1)}%`} />
+          </div>
+        </div>
+      )}
+
       {/* Drift Charts */}
-      {driftData.length > 0 && (
+      {driftData.length > 0 ? (
         <div className="card">
           <h2 className="card-title">per-feature drift scores (ks + psi)</h2>
           <p className="muted" style={{ marginBottom: '1rem' }}>
@@ -297,9 +427,7 @@ const MonitoringTab = ({ health, alerts, onResolve }: {
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
               <XAxis dataKey="name" stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
               <YAxis stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-              <Tooltip
-                contentStyle={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6 }}
-              />
+              <Tooltip contentStyle={TOOLTIP_STYLE} />
               <ReferenceLine y={0.25} stroke="var(--risk-critical)" strokeDasharray="4 2" label={{ value: 'PSI drift threshold', fill: 'var(--risk-critical)', fontSize: 10 }} />
               <Bar dataKey="psi" name="PSI" fill="var(--accent)" radius={[3, 3, 0, 0]} />
               <Bar dataKey="ks" name="KS statistic" fill="var(--accent-dim)" radius={[3, 3, 0, 0]} />
@@ -315,26 +443,72 @@ const MonitoringTab = ({ health, alerts, onResolve }: {
             ))}
           </div>
         </div>
+      ) : (
+        <div className="card">
+          <h2 className="card-title">per-feature drift scores (ks + psi)</h2>
+          <p className="muted">
+            collecting samples — drift statistics appear after 30 inferences
+            ({health?.drift_window_count ?? 0}/30 in the window).
+          </p>
+        </div>
       )}
 
-      {/* Active Alerts */}
+      {trendData.length > 1 && (
+        <div className="card">
+          <h2 className="card-title">psi trend (persisted drift snapshots)</h2>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={trendData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+              <XAxis dataKey="i" stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
+              <YAxis stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
+              <Tooltip contentStyle={TOOLTIP_STYLE} />
+              <ReferenceLine y={0.25} stroke="var(--risk-critical)" strokeDasharray="4 2" />
+              {SMART_FEATURES.map((f, i) => (
+                <Line key={f} type="monotone" dataKey={shortFeature(f)} stroke={FEATURE_COLORS[i]} dot={false} />
+              ))}
+              <Legend wrapperStyle={{ color: 'var(--text-muted)', fontSize: 12 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* Alerts */}
       <div className="card">
-        <h2 className="card-title">active alerts</h2>
+        <div className="card-title-row">
+          <h2 className="card-title">{alertFilter === 'active' ? 'active alerts' : 'alert history'}</h2>
+          <div className="segmented" role="group" aria-label="alert filter">
+            {(['active', 'all'] as const).map(f => (
+              <button
+                type="button" key={f} aria-pressed={alertFilter === f}
+                className={`seg-btn ${alertFilter === f ? 'active' : ''}`}
+                onClick={() => onAlertFilter(f)}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
+        </div>
+        {resolveError && <p className="error-msg" role="alert" style={{ marginBottom: '0.75rem' }}>{resolveError}</p>}
         {alerts.length === 0 ? (
-          <p className="muted">no active alerts — system is nominal.</p>
+          <p className="muted">{alertFilter === 'active' ? 'no active alerts — system is nominal.' : 'no alerts recorded yet.'}</p>
         ) : (
           <div className="alert-list">
             {alerts.map(a => (
-              <div key={a.id} className={`alert-item alert-${a.alert_type.toLowerCase()} severity-${a.severity.toLowerCase()}`}>
+              <div key={a.id} className={`alert-item alert-${a.alert_type.toLowerCase()} severity-${a.severity.toLowerCase()} ${a.status === 'RESOLVED' ? 'resolved' : ''}`}>
                 <div className="alert-header">
                   <span className="alert-type-badge">{a.alert_type}</span>
                   <span className={`alert-severity ${a.severity.toLowerCase()}`}>{a.severity}</span>
-                  <span className="alert-time">{new Date(a.created_at).toLocaleTimeString()}</span>
-                  <button className="btn btn-ghost btn-sm" onClick={() => onResolve(a.id)}>resolve</button>
+                  {a.status === 'RESOLVED' && <span className="alert-resolved-tag">resolved</span>}
+                  <time className="alert-time" dateTime={a.updated_at ?? a.created_at}>
+                    {new Date(a.updated_at ?? a.created_at).toLocaleTimeString()}
+                  </time>
+                  {a.status === 'ACTIVE' && (
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => void resolve(a.id)}>resolve</button>
+                  )}
                 </div>
                 <p className="alert-msg">{a.message}</p>
-                {a.escalation_count > 0 && (
-                  <p className="alert-escalation">escalated {a.escalation_count}× — consecutive occurrences</p>
+                {a.occurrences > 1 && (
+                  <p className="alert-escalation">seen {a.occurrences}× — escalated {a.escalation_count}×</p>
                 )}
               </div>
             ))}
@@ -345,31 +519,38 @@ const MonitoringTab = ({ health, alerts, onResolve }: {
   );
 };
 
+// ─── Model Autopsy Tab ────────────────────────────────────────────────────────
 
-const AutopsyTab = ({ fingerprint }: { fingerprint: Fingerprint | null }) => {
-  const [topology, setTopology] = useState<Record<string, unknown> | null>(null);
+const AutopsyTab = ({ fingerprint, onProbed }: { fingerprint: Fingerprint | null; onProbed: () => void }) => {
+  const [topology, setTopology] = useState<Topology | null>(null);
   const [loadingProbe, setLoadingProbe] = useState(false);
-  const [probeResult, setProbeResult] = useState<string>('');
+  const [probeResult, setProbeResult] = useState<{ ok: boolean; text: string } | null>(null);
 
   const runProbe = async () => {
-    setLoadingProbe(true); setProbeResult('');
+    setLoadingProbe(true); setProbeResult(null);
     try {
-      const res = await fetch(`${API_URL}/api/models/probe`, { method: 'POST' });
-      if (!res.ok) throw new Error('Probe failed');
-      const data = await res.json();
-      setProbeResult(`probe complete — fingerprint: ${data.fingerprint_id} | threshold: ${data.novelty_threshold?.toFixed(4)}`);
-    } catch {
-      setProbeResult('probe failed — check server logs.');
+      const data = await apiFetch<{
+        fingerprint_id: string; novelty_threshold: number | null; wasserstein_to_previous: number | null;
+      }>('/api/models/probe', { method: 'POST', admin: true });
+      const shift = data.wasserstein_to_previous !== null ? ` | baseline shift (W1): ${data.wasserstein_to_previous.toFixed(2)}` : '';
+      setProbeResult({
+        ok: true,
+        text: `probe complete — fingerprint: ${data.fingerprint_id} | threshold: ${data.novelty_threshold?.toFixed(4)}${shift}`,
+      });
+      onProbed();
+    } catch (err) {
+      setProbeResult({ ok: false, text: `probe failed — ${errorMessage(err)}` });
     } finally {
       setLoadingProbe(false);
     }
   };
 
   useEffect(() => {
-    fetch(`${API_URL}/api/models/topology`)
-      .then(r => r.json())
+    const ctrl = new AbortController();
+    apiFetch<Topology>('/api/models/topology', { signal: ctrl.signal })
       .then(setTopology)
-      .catch(() => {});
+      .catch(() => { /* topology is optional */ });
+    return () => ctrl.abort();
   }, []);
 
   const histogramData = fingerprint?.histogram?.bins?.map((bin, i) => ({
@@ -377,8 +558,8 @@ const AutopsyTab = ({ fingerprint }: { fingerprint: Fingerprint | null }) => {
   })).filter(d => d.count > 0) || [];
 
   const featureImportanceData = Object.entries(fingerprint?.feature_importance || {}).map(([feat, val]) => ({
-    name: feat.replace('smart_', 'S').replace('_raw', ''),
-    importance: Math.round((val as number) * 100),
+    name: shortFeature(feat),
+    importance: Math.round(val * 100),
   })).sort((a, b) => b.importance - a.importance);
 
   return (
@@ -387,12 +568,16 @@ const AutopsyTab = ({ fingerprint }: { fingerprint: Fingerprint | null }) => {
         <h2 className="card-title">model autopsy & fingerprint</h2>
         <p className="muted" style={{ marginBottom: '1rem' }}>
           Run a 500-sample Latin Hypercube Sampling probe across the full SMART feature space.
-          This builds the FAISS novelty index and behavioral fingerprint.
+          This rebuilds the FAISS novelty index and behavioral fingerprint. Requires the admin key.
         </p>
-        <button className="btn btn-primary" onClick={runProbe} disabled={loadingProbe}>
+        <button type="button" className="btn btn-primary" onClick={runProbe} disabled={loadingProbe}>
           {loadingProbe ? 'probing...' : 'run lhs probe sweep'}
         </button>
-        {probeResult && <p className="success-msg" style={{ marginTop: '0.75rem' }}>{probeResult}</p>}
+        {probeResult && (
+          <p className={probeResult.ok ? 'success-msg' : 'error-msg'} role="status" style={{ marginTop: '0.75rem' }}>
+            {probeResult.text}
+          </p>
+        )}
       </div>
 
       {fingerprint && (
@@ -401,7 +586,7 @@ const AutopsyTab = ({ fingerprint }: { fingerprint: Fingerprint | null }) => {
           <div className="metric-grid">
             <StatCard label="fingerprint id" value={fingerprint.fingerprint_id} />
             <StatCard label="probe samples" value={fingerprint.n_probe_samples} />
-            <StatCard label="prediction entropy" value={fingerprint.prediction_entropy.toFixed(3)} sub="0=uniform, 1=max spread" />
+            <StatCard label="prediction entropy" value={fingerprint.prediction_entropy.toFixed(3)} sub="0=concentrated, 1=max spread" />
             <StatCard label="uncertainty rate" value={`${(fingerprint.uncertainty_rate * 100).toFixed(1)}%`} sub="fraction predicting <90d" />
           </div>
 
@@ -421,7 +606,7 @@ const AutopsyTab = ({ fingerprint }: { fingerprint: Fingerprint | null }) => {
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
                 <XAxis dataKey="day" stroke="var(--text-muted)" tick={{ fontSize: 10 }} label={{ value: 'days', position: 'insideBottomRight', fill: 'var(--text-muted)', fontSize: 11 }} />
                 <YAxis stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-                <Tooltip contentStyle={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6 }} />
+                <Tooltip contentStyle={TOOLTIP_STYLE} />
                 <Bar dataKey="count" fill="var(--accent)" radius={[2, 2, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -436,7 +621,7 @@ const AutopsyTab = ({ fingerprint }: { fingerprint: Fingerprint | null }) => {
                   <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" horizontal={false} />
                   <XAxis type="number" stroke="var(--text-muted)" tick={{ fontSize: 11 }} tickFormatter={v => `${v}%`} />
                   <YAxis type="category" dataKey="name" stroke="var(--text-muted)" tick={{ fontSize: 11 }} width={40} />
-                  <Tooltip contentStyle={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6 }} formatter={(v) => `${v}%`} />
+                  <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(v) => `${v}%`} />
                   <Bar dataKey="importance" fill="var(--accent)" radius={[0, 3, 3, 0]} />
                 </BarChart>
               </ResponsiveContainer>
@@ -468,13 +653,13 @@ const AutopsyTab = ({ fingerprint }: { fingerprint: Fingerprint | null }) => {
         <div className="card">
           <h2 className="card-title">xgboost ensemble topology</h2>
           <div className="metric-grid" style={{ marginBottom: '1.5rem' }}>
-            <StatCard label="n trees" value={(topology.n_trees as number) || 0} />
-            <StatCard label="total nodes" value={(topology.total_nodes as number) || 0} />
-            <StatCard label="total leaves" value={(topology.total_leaves as number) || 0} />
-            <StatCard label="max depth" value={(topology.max_depth as number) || 0} />
+            <StatCard label="n trees" value={topology.n_trees || 0} />
+            <StatCard label="total nodes" value={topology.total_nodes || 0} />
+            <StatCard label="total leaves" value={topology.total_leaves || 0} />
+            <StatCard label="max depth" value={topology.max_depth || 0} />
           </div>
           <div className="topology-trees">
-            {((topology.tree_summaries as Array<Record<string, number>>) || []).map((t) => (
+            {(topology.tree_summaries || []).map(t => (
               <div key={t.tree_id} className="tree-chip">
                 <span className="tree-id">tree {t.tree_id}</span>
                 <span className="tree-meta">{t.n_nodes} nodes · {t.n_leaves} leaves · depth {t.max_depth}</span>
@@ -487,51 +672,116 @@ const AutopsyTab = ({ fingerprint }: { fingerprint: Fingerprint | null }) => {
   );
 };
 
+// ─── Admin key panel ──────────────────────────────────────────────────────────
+
+const AdminPanel = ({ adminEnabled, onClose }: { adminEnabled: boolean | null; onClose: () => void }) => {
+  const [value, setValue] = useState(getAdminKey());
+  const [saved, setSaved] = useState(false);
+
+  const save = (e: FormEvent) => {
+    e.preventDefault();
+    setAdminKey(value.trim());
+    setSaved(true);
+  };
+
+  return (
+    <form className="admin-panel card" onSubmit={save} aria-label="admin access">
+      <div className="input-group" style={{ marginBottom: 0, flex: 1 }}>
+        <label htmlFor="admin-key">admin api key</label>
+        <input
+          id="admin-key" type="password" autoComplete="off" value={value}
+          onChange={e => { setValue(e.target.value); setSaved(false); }}
+          placeholder="required for probe sweeps and resolving alerts"
+        />
+      </div>
+      <div className="admin-actions">
+        <button type="submit" className="btn btn-primary" style={{ marginTop: 0 }}>{value ? 'save' : 'clear'}</button>
+        <button type="button" className="btn btn-ghost" onClick={onClose}>close</button>
+      </div>
+      <p className="muted admin-note">
+        {saved ? '✓ saved for this browser tab. ' : ''}
+        stored in session storage only — cleared when the tab closes.
+        {adminEnabled === false && ' note: the server has no admin key configured, so admin actions are disabled.'}
+      </p>
+    </form>
+  );
+};
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
+type TabId = 'inference' | 'fleet' | 'monitoring' | 'autopsy';
+
+const TABS: Array<{ id: TabId; label: string }> = [
+  { id: 'inference', label: 'inference' },
+  { id: 'fleet', label: 'fleet scan' },
+  { id: 'monitoring', label: 'monitoring' },
+  { id: 'autopsy', label: 'model autopsy' },
+];
+
 export default function DataCenterGuardian() {
-  const [activeTab, setActiveTab] = useState('inference');
+  const [activeTab, setActiveTab] = useState<TabId>('inference');
   const [health, setHealth] = useState<HealthData | null>(null);
+  const [online, setOnline] = useState<boolean | null>(null);
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [alertFilter, setAlertFilter] = useState<'active' | 'all'>('active');
   const [fingerprint, setFingerprint] = useState<Fingerprint | null>(null);
+  const [summary, setSummary] = useState<PredictionSummary | null>(null);
+  const [driftHistory, setDriftHistory] = useState<DriftSnapshot[]>([]);
+  const [meta, setMeta] = useState<ApiMeta | null>(null);
+  const [showAdmin, setShowAdmin] = useState(false);
 
-  const tabs = [
-    { id: 'inference', label: 'inference' },
-    { id: 'monitoring', label: 'monitoring' },
-    { id: 'autopsy', label: 'model autopsy' },
-  ];
+  const refresh = useCallback(async () => {
+    const results = await Promise.allSettled([
+      apiFetch<HealthData>('/api/models/health'),
+      apiFetch<Alert[]>(`/api/models/alerts?status=${alertFilter}`),
+      apiFetch<Fingerprint>('/api/models/fingerprint'),
+      apiFetch<PredictionSummary>('/api/models/predictions/summary'),
+      apiFetch<DriftSnapshot[]>('/api/models/drift/history?limit=30'),
+    ]);
+    const [h, a, fp, s, dh] = results;
+    setOnline(h.status === 'fulfilled');
+    if (h.status === 'fulfilled') setHealth(h.value);
+    if (a.status === 'fulfilled') setAlerts(a.value);
+    if (fp.status === 'fulfilled') setFingerprint(fp.value);
+    if (s.status === 'fulfilled') setSummary(s.value);
+    if (dh.status === 'fulfilled') setDriftHistory(dh.value);
+  }, [alertFilter]);
 
-  const fetchHealth = useCallback(async () => {
-    try {
-      const [healthRes, alertsRes, fpRes] = await Promise.all([
-        fetch(`${API_URL}/api/models/health`),
-        fetch(`${API_URL}/api/models/alerts`),
-        fetch(`${API_URL}/api/models/fingerprint`),
-      ]);
-      if (healthRes.ok) setHealth(await healthRes.json());
-      if (alertsRes.ok) setAlerts(await alertsRes.json());
-      if (fpRes.ok) setFingerprint(await fpRes.json());
-    } catch { /* silent */ }
-  }, []);
+  // Poll every few seconds, but only while the browser tab is visible.
+  useEffect(() => {
+    const tick = () => { if (!document.hidden) void refresh(); };
+    const first = setTimeout(tick, 0);
+    const interval = setInterval(tick, POLL_MS);
+    document.addEventListener('visibilitychange', tick);
+    return () => {
+      clearTimeout(first);
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', tick);
+    };
+  }, [refresh]);
 
   useEffect(() => {
-    fetchHealth();
-    const interval = setInterval(fetchHealth, 5000);
-    return () => clearInterval(interval);
-  }, [fetchHealth]);
+    apiFetch<ApiMeta>('/api').then(setMeta).catch(() => { /* optional */ });
+  }, []);
 
-  const resolveAlert = async (id: string) => {
+  const resolveAlert = async (id: string): Promise<string | null> => {
     try {
-      await fetch(`${API_URL}/api/models/alerts/${id}`, { method: 'DELETE' });
-      fetchHealth();
-    } catch { /* silent */ }
+      await apiFetch(`/api/models/alerts/${encodeURIComponent(id)}`, { method: 'DELETE', admin: true });
+      void refresh();
+      return null;
+    } catch (err) {
+      return errorMessage(err);
+    }
   };
 
   const criticalCount = health?.alerts?.critical_count || 0;
   const activeAlertCount = health?.alerts?.total_active || 0;
+  const statusLabel = online === false ? 'offline' : health?.status || 'connecting...';
+  const statusColor = online === false ? 'red' : health?.status === 'healthy' ? 'green' : health ? 'amber' : 'grey';
 
   return (
     <div className="dashboard-container">
+      <a href="#main" className="skip-link">skip to content</a>
       <header className="header">
         <div>
           <h1 className="title">data center guardian</h1>
@@ -539,14 +789,32 @@ export default function DataCenterGuardian() {
         </div>
         <div className="header-right">
           {activeAlertCount > 0 && (
-            <div className={`global-alert-badge ${criticalCount > 0 ? 'critical' : 'warning'}`}>
+            <button
+              type="button"
+              className={`global-alert-badge ${criticalCount > 0 ? 'critical' : 'warning'}`}
+              onClick={() => setActiveTab('monitoring')}
+            >
               {criticalCount > 0 ? '🔴' : '🟡'} {activeAlertCount} alert{activeAlertCount > 1 ? 's' : ''} active
-            </div>
+            </button>
           )}
-          <div className={`status-dot ${health?.status === 'healthy' ? 'green' : 'red'}`} title={health?.status || 'connecting...'} />
-          <nav className="tabs">
-            {tabs.map(t => (
-              <button key={t.id} className={`tab-btn ${activeTab === t.id ? 'active' : ''}`} onClick={() => setActiveTab(t.id)}>
+          <span className="status-wrap" title={statusLabel}>
+            <span className={`status-dot ${statusColor}`} aria-hidden="true" />
+            <span className="status-text">{statusLabel}</span>
+          </span>
+          <button
+            type="button" className={`btn btn-ghost btn-sm ${showAdmin ? 'active' : ''}`}
+            aria-expanded={showAdmin} onClick={() => setShowAdmin(s => !s)}
+          >
+            🔒 admin
+          </button>
+          <nav className="tabs" role="tablist" aria-label="dashboard sections">
+            {TABS.map(t => (
+              <button
+                key={t.id} type="button" role="tab" id={`tab-${t.id}`}
+                aria-selected={activeTab === t.id} aria-controls="main"
+                className={`tab-btn ${activeTab === t.id ? 'active' : ''}`}
+                onClick={() => setActiveTab(t.id)}
+              >
                 {t.label}
               </button>
             ))}
@@ -554,11 +822,30 @@ export default function DataCenterGuardian() {
         </div>
       </header>
 
-      <main>
+      {showAdmin && <AdminPanel adminEnabled={meta ? meta.admin_enabled : null} onClose={() => setShowAdmin(false)} />}
+
+      {online === false && (
+        <div className="offline-banner" role="status">
+          cannot reach the inference server — retrying every {POLL_MS / 1000}s.
+        </div>
+      )}
+
+      <main id="main" role="tabpanel" aria-labelledby={`tab-${activeTab}`}>
         {activeTab === 'inference' && <InferenceTab />}
-        {activeTab === 'monitoring' && <MonitoringTab health={health} alerts={alerts} onResolve={resolveAlert} />}
-        {activeTab === 'autopsy' && <AutopsyTab fingerprint={fingerprint} />}
+        {activeTab === 'fleet' && <FleetTab maxBatch={meta?.max_batch_size || 100} />}
+        {activeTab === 'monitoring' && (
+          <MonitoringTab
+            health={health} alerts={alerts} summary={summary} driftHistory={driftHistory}
+            alertFilter={alertFilter} onAlertFilter={setAlertFilter} onResolve={resolveAlert}
+          />
+        )}
+        {activeTab === 'autopsy' && <AutopsyTab fingerprint={fingerprint} onProbed={() => void refresh()} />}
       </main>
+
+      <footer className="footer">
+        <span>xgboost aft survival model{meta?.model_sha256 ? ` · model ${meta.model_sha256.slice(0, 8)}` : ''}{meta?.version ? ` · api v${meta.version}` : ''}</span>
+        <span>predictions are decision support, not a guarantee — always keep backups.</span>
+      </footer>
     </div>
   );
 }
