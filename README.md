@@ -22,6 +22,9 @@ by predicting the time-to-failure (TTF), data center operators can perform proac
 ## key features
 
 - **real-time RUL prediction:** input live SMART telemetry to instantly receive an estimated time-to-failure (TTF) in days.
+- **fleet scan:** upload a CSV of drives and score the whole fleet in one batch, sorted by urgency, with downloadable results.
+- **per-drive history:** pass an optional `serial_number` and track how a drive's predicted RUL trends over time.
+- **model observability:** latent-space novelty detection (FAISS), KS/PSI drift monitoring with persisted snapshots, de-duplicated alerts with escalation, and a behavioral model fingerprint.
 - **decoupled microservice architecture:** frontend UI hosted on the vercel edge network, backend inference API hosted on hugging face spaces.
 - **survival analysis:** utilizes xgboost trained with an accelerated failure time (`survival:aft`) objective to handle right-censored data accurately.
 - **continuous training (CT) pipeline:** a fully automated CI/CD pipeline powered by github actions that scrapes new quarterly backblaze datasets, retrains the model natively, and hot-swaps the production weights.
@@ -104,8 +107,10 @@ if you want to run the platform locally on your own machine:
 
 3. **run the local API server:**
    ```bash
+   export GUARDIAN_ADMIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
    uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
    ```
+   the admin key unlocks the probe sweep and alert resolution. paste it into the dashboard via the **🔒 admin** button. without it, those endpoints return `503` (fail closed).
 
 4. **run the local frontend server:**
    open a new terminal window:
@@ -115,12 +120,64 @@ if you want to run the platform locally on your own machine:
    npm run dev
    ```
 
+5. **run the tests:**
+   ```bash
+   python -m pytest -q
+   ```
+
+## configuration
+
+all settings are environment variables (see `src/api/config.py`):
+
+| variable | default | purpose |
+|---|---|---|
+| `GUARDIAN_ADMIN_API_KEY` | *(unset → admin disabled)* | key required in the `X-API-Key` header for admin endpoints |
+| `DATABASE_URL` | `sqlite:///./guardian.db` | SQLAlchemy URL (SQLite or Postgres) |
+| `CORS_ORIGINS` | vercel + hf + localhost | comma-separated allowed browser origins |
+| `RATE_LIMIT_PREDICT` / `_BATCH` / `_PROBE` / `_READ` | `60/minute` / `10/minute` / `5/minute` / `120/minute` | per-IP rate limits |
+| `RATE_LIMIT_ENABLED` | `true` | disable only for tests |
+| `MAX_BATCH_SIZE` | `100` | max drives per batch request |
+| `DRIFT_CHECK_INTERVAL` | `50` | compute drift every N inferences |
+| `PROBE_SAMPLES` | `500` | LHS probe samples on startup |
+| `ENABLE_DOCS` | `true` | expose `/docs`, `/redoc`, `/openapi.json` |
+| `FORWARDED_ALLOW_IPS` | `*` (Docker) | proxies trusted for `X-Forwarded-For`; set to your proxy IP when not behind HF |
+
+## API overview
+
+| method | path | auth | description |
+|---|---|---|---|
+| `POST` | `/api/models/predict` | – | score one drive (novelty, drift, alerts) |
+| `POST` | `/api/models/predict/batch` | – | score up to `MAX_BATCH_SIZE` drives |
+| `GET` | `/api/models/predictions` | – | recent predictions (`limit`, `offset`, `risk_level`, `serial_number`) |
+| `GET` | `/api/models/predictions/export` | – | predictions as CSV |
+| `GET` | `/api/models/predictions/summary` | – | risk-tier counts, novelty rate, mean RUL |
+| `GET` | `/api/drives/{serial}/history` | – | one drive's prediction history and RUL trend |
+| `GET` | `/api/models/health` | – | model, FAISS, drift and alert status |
+| `GET` | `/api/models/alerts?status=active\|all` | – | alerts |
+| `DELETE` | `/api/models/alerts/{id}` | admin | resolve an alert |
+| `GET` | `/api/models/drift/history` | – | persisted drift snapshots |
+| `POST` | `/api/models/probe` | admin | rebuild baseline (LHS probe sweep) |
+| `GET` | `/api/models/fingerprint`, `/api/models/topology` | – | model autopsy |
+| `GET` | `/healthz` | – | readiness probe (503 until the model is loaded) |
+| `POST` | `/predict` | – | legacy endpoint (deprecated) |
+
+## security
+
+- state-mutating endpoints require an API key (constant-time compare, fail closed when unset).
+- per-IP rate limits on every endpoint; strict input validation (bounded ints, identifier patterns, bounded query params).
+- security headers on every response (CSP, `X-Frame-Options: DENY`, `nosniff`, referrer and permissions policy) and an `X-Request-ID` for tracing.
+- generic error responses: no stack traces or echoed request bodies.
+- CSV exports are protected against spreadsheet formula injection.
+- the ETL only downloads from the Backblaze bucket, uses timeouts, and rejects zip path traversal / zip bombs.
+- see [`AUDIT.md`](AUDIT.md) for the full audit.
+
 ## automated deployment
 
 ### backend (hugging face)
 1. create a new hugging face space and select the "docker" SDK.
 2. click "sync with a github repository" and point it to this repo.
 3. hugging face will automatically read the YAML metadata at the top of this readme, build the `Dockerfile`, and expose port 7860.
+4. add `GUARDIAN_ADMIN_API_KEY` as a **space secret** to enable admin actions.
 
 ### frontend (vercel)
 1. log into vercel and click "import project".
