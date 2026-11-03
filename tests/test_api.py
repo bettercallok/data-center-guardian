@@ -212,3 +212,11 @@ class TestSecurity:
         assert _csv_safe("@SUM(A1)") == "'@SUM(A1)"
         assert _csv_safe("-12.5") == "-12.5"
         assert _csv_safe(None) == ""
+
+
+def test_topology_reports_real_tree_depth(client):
+    body = client.get("/api/models/topology").json()
+    # Model is trained with max_depth=6; depth must be computed, not defaulted to 0/None
+    assert 1 <= body["max_depth"] <= 6
+    assert all(1 <= t["max_depth"] <= 6 for t in body["tree_summaries"])
+    assert body["total_leaves"] < body["total_nodes"]
