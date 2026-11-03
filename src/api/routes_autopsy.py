@@ -1,59 +1,74 @@
 """
 api/routes_autopsy.py — Model Autopsy Routes
 
-POST /api/models/probe       — Run LHS probe sweep + compile behavioral fingerprint
+POST /api/models/probe       — Run LHS probe sweep + compile behavioral fingerprint (admin)
 GET  /api/models/fingerprint — Return the current behavioral fingerprint
 GET  /api/models/topology    — Return extracted XGBoost tree architecture info
 """
 import logging
-import numpy as np
+import threading
+
 import xgboost as xgb
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from fastapi import APIRouter, HTTPException, Request
+from src.api.config import settings
+from src.api.security import limiter, require_admin
+from src.probing.fingerprint import compile_fingerprint, wasserstein_distance
+from src.probing.lhs_sampler import lhs_sample, novelty_probe_sample
 
-from src.probing.lhs_sampler import lhs_sample, get_feature_stats
-from src.probing.fingerprint import compile_fingerprint
+FEATURE_MAP = {
+    "f0": "smart_5_raw",
+    "f1": "smart_187_raw",
+    "f2": "smart_188_raw",
+    "f3": "smart_197_raw",
+    "f4": "smart_198_raw",
+}
+
+# Only one probe sweep may run at a time (it rebuilds shared monitoring state).
+_probe_lock = threading.Lock()
+
+
+def run_probe_sweep(state, n_samples: int):
+    """Generate LHS probes and rebuild fingerprint, FAISS index and drift baseline."""
+    probe_X = lhs_sample(n_samples)
+    probe_ttf_preds = state.model.predict(xgb.DMatrix(probe_X))
+    fp = compile_fingerprint(state.model, probe_X, probe_ttf_preds)
+    # The novelty index also covers the realistic, zero-inflated healthy region.
+    state.faiss_indexer.build(state.model, novelty_probe_sample(n_samples))
+    state.drift_detector.calibrate(probe_X)
+    previous = state.fingerprint
+    state.fingerprint = fp
+    return fp, previous
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/models", tags=["autopsy"])
 
 
-@router.post("/probe")
-async def run_probe(request: Request, n_samples: int = 500):
+@router.post("/probe", dependencies=[Depends(require_admin)])
+@limiter.limit(settings.rate_limit_probe)
+def run_probe(request: Request, n_samples: int = Query(500, ge=100, le=2000)):
     """
-    Run a full LHS probe sweep:
+    Run a full LHS probe sweep (requires the admin API key):
       1. Generate n_samples LHS points across the SMART feature space
       2. Run all through the survival model
       3. Compile the behavioral fingerprint
       4. Build the FAISS novelty index
       5. Calibrate the drift detector
 
-    This endpoint must be called at least once before novelty scoring works.
-    It is automatically called on startup.
+    It is automatically run on startup. The response includes the Wasserstein
+    distance to the previous fingerprint so operators can see baseline shift.
     """
     state = request.app.state
 
     if state.model is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
-
-    n_samples = max(100, min(n_samples, 2000))  # clamp to safe range
-
-    logger.info("Probe sweep: generating %d LHS samples...", n_samples)
-    probe_X = lhs_sample(n_samples)
-
-    # Run inference over all probe samples
-    dmatrix = xgb.DMatrix(probe_X)
-    probe_ttf_preds = state.model.predict(dmatrix)
-
-    # Compile fingerprint
-    fp = compile_fingerprint(state.model, probe_X, probe_ttf_preds)
-    state.fingerprint = fp
-
-    # Build FAISS index
-    state.faiss_indexer.build(state.model, probe_X)
-
-    # Calibrate drift detector
-    state.drift_detector.calibrate(probe_X)
+    if not _probe_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A probe sweep is already running.")
+    try:
+        logger.info("Probe sweep: generating %d LHS samples...", n_samples)
+        fp, previous = run_probe_sweep(state, n_samples)
+    finally:
+        _probe_lock.release()
 
     logger.info("Probe sweep complete. Fingerprint ID: %s", fp.fingerprint_id)
 
@@ -61,6 +76,8 @@ async def run_probe(request: Request, n_samples: int = 500):
         "status": "success",
         "n_samples": n_samples,
         "fingerprint_id": fp.fingerprint_id,
+        "previous_fingerprint_id": previous.fingerprint_id if previous else None,
+        "wasserstein_to_previous": wasserstein_distance(previous, fp) if previous else None,
         "faiss_built": state.faiss_indexer.is_built,
         "novelty_threshold": state.faiss_indexer.threshold,
         "summary": {
@@ -74,7 +91,8 @@ async def run_probe(request: Request, n_samples: int = 500):
 
 
 @router.get("/fingerprint")
-async def get_fingerprint(request: Request):
+@limiter.limit(settings.rate_limit_read)
+def get_fingerprint(request: Request):
     """Return the current behavioral fingerprint of the production model."""
     state = request.app.state
     fp = state.fingerprint
@@ -107,7 +125,8 @@ async def get_fingerprint(request: Request):
 
 
 @router.get("/topology")
-async def get_topology(request: Request):
+@limiter.limit(settings.rate_limit_read)
+def get_topology(request: Request):
     """
     Extract and return the XGBoost model's internal architecture.
 
@@ -123,9 +142,13 @@ async def get_topology(request: Request):
     if state.model is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
+    cached = getattr(state, "topology_cache", None)
+    if cached is not None:
+        return cached
+
     model = state.model
 
-    # Extract trees as a dataframe
+    # Extract trees as a dataframe (expensive — result is cached per model load)
     trees_df = model.trees_to_dataframe()
 
     n_trees = trees_df["Tree"].nunique()
@@ -136,13 +159,7 @@ async def get_topology(request: Request):
     # Feature importance by type
     importance_types = ["gain", "weight", "cover"]
     feature_importance = {}
-    feat_map = {
-        "f0": "smart_5_raw",
-        "f1": "smart_187_raw",
-        "f2": "smart_188_raw",
-        "f3": "smart_197_raw",
-        "f4": "smart_198_raw",
-    }
+    feat_map = FEATURE_MAP
     for imp_type in importance_types:
         raw = model.get_score(importance_type=imp_type)
         total = sum(raw.values()) or 1.0
@@ -163,7 +180,7 @@ async def get_topology(request: Request):
             "max_depth": tree_depth,
         })
 
-    return {
+    topology = {
         "model_type": "XGBoost Accelerated Failure Time (survival:aft)",
         "n_trees": n_trees,
         "total_nodes": total_nodes,
@@ -174,3 +191,5 @@ async def get_topology(request: Request):
         "feature_importance": feature_importance,
         "tree_summaries": tree_summaries,
     }
+    state.topology_cache = topology
+    return topology

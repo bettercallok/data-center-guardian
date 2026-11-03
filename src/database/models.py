@@ -29,6 +29,10 @@ class InferenceRecord(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     created_at = Column(DateTime(timezone=True), default=_utcnow, index=True)
 
+    # Optional drive identity (enables per-drive history / fleet views)
+    serial_number = Column(String(64), nullable=True, index=True)
+    drive_model = Column(String(64), nullable=True)
+
     # Inputs
     smart_5_raw = Column(Float, nullable=False)
     smart_187_raw = Column(Float, nullable=False)
@@ -64,8 +68,10 @@ class AlertRecord(Base):
     message = Column(Text, nullable=False)
     metadata_json = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow, index=True)
+    updated_at = Column(DateTime(timezone=True), nullable=True)
     resolved_at = Column(DateTime(timezone=True), nullable=True)
     escalation_count = Column(Integer, default=0)
+    occurrences = Column(Integer, default=1)
 
 
 class DriftSnapshot(Base):

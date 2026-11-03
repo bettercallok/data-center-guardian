@@ -13,9 +13,15 @@ on:
 permissions:
   contents: write
 
+# Never let two training runs race to push model artifacts.
+concurrency:
+  group: mlops-continuous-training
+  cancel-in-progress: false
+
 jobs:
   continuous-training:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -31,12 +37,16 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Extract & Process Telemetry (ETL)
-        run: python src/etl/pipeline.py --mock
-        # Note: In a true production environment, you would remove --mock
-        # and pull the latest Backblaze CSVs here.
+        # Fetches the newest Backblaze quarter. Exits non-zero on any failure,
+        # so a broken download can never produce a model trained on fake data.
+        run: python src/etl/pipeline.py
 
       - name: Train XGBoost & Export
+        # Includes a data quality gate (minimum drives / failures).
         run: python src/ml/train_survival.py --cpu
+
+      - name: Validate new model against the test-suite
+        run: python -m pytest -q
 
       - name: Commit Updated Model Artifacts
         run: |

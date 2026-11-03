@@ -13,3 +13,7 @@ data/processed/survival_data.parquet
 compiled_smart_data.csv
 # frontend environment files — .env.example is safe to commit, .env is not
 frontend/.env
+# local SQLite databases and python tooling caches
+*.db
+.pytest_cache/
+*.zip.part

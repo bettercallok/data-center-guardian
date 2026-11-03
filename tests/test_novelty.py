@@ -82,3 +82,32 @@ class TestFAISSNoveltyIndexer:
         batch_results = indexer.score_batch(booster, X)
         assert len(batch_results) == 1
         assert abs(batch_results[0].distance - single_result.distance) < 1e-4
+
+
+@pytest.fixture(scope="module")
+def realistic_indexer(booster):
+    from src.probing.lhs_sampler import novelty_probe_sample
+    indexer = FAISSNoveltyIndexer()
+    indexer.build(booster, novelty_probe_sample(500))
+    return indexer
+
+
+class TestRealisticHealthyFleet:
+    """Regression: healthy, mostly-zero SMART counters must not be flagged as novel."""
+
+    def test_all_zero_drive_is_not_novel(self, realistic_indexer, booster):
+        result = realistic_indexer.score(booster, np.zeros((1, 5), dtype=np.float32))
+        assert not result.is_novel
+        assert result.novelty_score < 0.5
+
+    def test_healthy_traffic_has_low_false_novel_rate(self, realistic_indexer, booster):
+        rng = np.random.RandomState(1)
+        healthy = (rng.poisson(1.0, size=(300, 5)) * (rng.uniform(size=(300, 5)) < 0.3)).astype(np.float32)
+        results = realistic_indexer.score_batch(booster, healthy)
+        false_novel = sum(r.is_novel for r in results) / len(results)
+        assert false_novel < 0.02
+
+    def test_distance_is_normalised(self, realistic_indexer, booster):
+        X = np.array([[10, 5, 0, 2, 2], [400, 150, 900, 450, 450]], dtype=np.float32)
+        for r in realistic_indexer.score_batch(booster, X):
+            assert 0.0 <= r.distance <= 1.0
