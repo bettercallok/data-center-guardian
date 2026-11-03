@@ -1,17 +1,20 @@
-import { useState, useEffect, useCallback, useRef, type FormEvent } from 'react';
+import { useState, useEffect, useCallback, useRef, type DragEvent, type FormEvent } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  Line, LineChart, ReferenceLine, Legend, AreaChart, Area
+  Line, LineChart, ReferenceLine, Legend, AreaChart, Area, Cell
 } from 'recharts';
 
 import { API_URL, apiFetch, errorMessage, getAdminKey, setAdminKey } from './api';
 import { CSV_TEMPLATE, MAX_CSV_BYTES, downloadText, parseFleetCsv } from './csv';
+import { RISK_ACTION, humanDuration } from './format';
+import { SERIES_COLORS, applyTheme, axisProps, gridProps, initialTheme, legendProps, tooltipProps, type ThemeMode } from './theme';
 import {
-  FEATURE_LABELS, RISK_ORDER, SMART_FEATURES,
+  FEATURE_META, RISK_ORDER, SMART_FEATURES,
   type Alert, type ApiMeta, type BatchPredictionResponse, type DriftSnapshot, type DriveTelemetry,
   type EnrichedPrediction, type Fingerprint, type HealthData, type PredictionSummary,
   type RiskLevel, type SmartFeature, type SmartValues, type Topology,
 } from './types';
+import { CardHeader, EmptyState, Icon, LifeGauge, NoveltyIndicator, RiskBadge, StatCard, type IconName, type Tone } from './ui';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -23,57 +26,34 @@ const PRESETS: Array<{ id: string; label: string; values: SmartValues }> = [
   { id: 'failing', label: 'failing', values: { smart_5_raw: 320, smart_187_raw: 120, smart_188_raw: 600, smart_197_raw: 280, smart_198_raw: 280 } },
 ];
 
-const TOOLTIP_STYLE = { background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6 };
-const FEATURE_COLORS = ['#4f8ef7', '#22c55e', '#f59e0b', '#f97316', '#a78bfa'];
+const RISK_TIERS: RiskLevel[] = ['critical', 'high', 'medium', 'low'];
 
 const shortFeature = (f: string) => f.replace('smart_', 'S').replace('_raw', '');
 const clampSmart = (raw: string) => {
   const n = Math.floor(Number(raw));
   return Number.isFinite(n) ? Math.min(65535, Math.max(0, n)) : 0;
 };
-
-// ─── Sub-components ────────────────────────────────────────────────────────────
-
-const RiskBadge = ({ level }: { level: string }) => (
-  <span className={`badge badge-${level}`}>{level}</span>
-);
-
-const NoveltyIndicator = ({ score, isNovel }: { score: number | null; isNovel: boolean | null }) => {
-  if (score === null) return <span className="novelty-na">—</span>;
-  // Track spans 0 → 1.5; the threshold marker sits at 1.0 (2/3 of the track).
-  const pct = Math.min(score / 1.5, 1) * 100;
-  return (
-    <div className="novelty-bar-wrap">
-      <div
-        className="novelty-bar-track"
-        role="meter"
-        aria-valuemin={0}
-        aria-valuemax={1.5}
-        aria-valuenow={Number(score.toFixed(2))}
-        aria-label="novelty score"
-      >
-        <div
-          className="novelty-bar-fill"
-          style={{ width: `${pct}%`, background: isNovel ? 'var(--risk-critical)' : 'var(--accent-glow)' }}
-        />
-        <div className="novelty-threshold-line" />
-      </div>
-      <span className={`novelty-label ${isNovel ? 'novel' : 'normal'}`}>
-        {isNovel ? '⚠ NOVEL' : '✓ normal'} ({score.toFixed(2)})
-      </span>
-    </div>
-  );
-};
-
-const StatCard = ({ label, value, sub }: { label: string; value: string | number; sub?: string }) => (
-  <div className="stat-card">
-    <span className="stat-label">{label}</span>
-    <span className="stat-value">{value}</span>
-    {sub && <span className="stat-sub">{sub}</span>}
-  </div>
-);
+const fmtDays = (d: number) => `${Math.round(d).toLocaleString()}d`;
 
 // ─── Inference Tab ────────────────────────────────────────────────────────────
+
+const PredictionHero = ({ p }: { p: EnrichedPrediction }) => (
+  <div className={`hero tone-${p.risk_level}`}>
+    <div className="hero-top">
+      <div>
+        <span className="eyebrow">remaining useful life</span>
+        <div className="hero-value">
+          <span className="hero-number">{Math.round(p.rul_days).toLocaleString()}</span>
+          <span className="hero-unit">days</span>
+        </div>
+        <span className="hero-sub">{humanDuration(p.rul_days)} · includes a 30-day maintenance buffer</span>
+      </div>
+      <RiskBadge level={p.risk_level} />
+    </div>
+    <LifeGauge ttfDays={p.ttf_days} />
+    <p className="hero-action"><Icon name={p.risk_level === 'low' ? 'check' : 'alert'} size={15} />{RISK_ACTION[p.risk_level]}</p>
+  </div>
+);
 
 const InferenceTab = () => {
   const [telemetry, setTelemetry] = useState<SmartValues>(PRESETS[1].values);
@@ -82,6 +62,8 @@ const InferenceTab = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [history, setHistory] = useState<Array<EnrichedPrediction & { key: number }>>([]);
+
+  const activePreset = PRESETS.find(p => SMART_FEATURES.every(f => p.values[f] === telemetry[f]))?.id;
 
   const runPrediction = async (e: FormEvent) => {
     e.preventDefault();
@@ -105,103 +87,110 @@ const InferenceTab = () => {
   }));
 
   return (
-    <div className="tab-content stagger-enter">
-      <div className="two-col">
-        {/* Left: Inputs */}
+    <div className="tab-content">
+      <div className="split">
+        {/* Inputs */}
         <form className="card" onSubmit={runPrediction}>
-          <h2 className="card-title">smart telemetry inputs</h2>
-          <div className="preset-row" role="group" aria-label="telemetry presets">
-            <span className="stat-label">presets</span>
-            {PRESETS.map(p => (
-              <button type="button" key={p.id} className="btn btn-ghost btn-sm" onClick={() => setTelemetry(p.values)}>
-                {p.label}
-              </button>
-            ))}
+          <CardHeader title="SMART telemetry" description="Raw counter values reported by the drive." />
+          <div className="field-row">
+            <span className="field-label">presets</span>
+            <div className="chip-group" role="group" aria-label="telemetry presets">
+              {PRESETS.map(p => (
+                <button
+                  type="button" key={p.id} aria-pressed={activePreset === p.id}
+                  className={`chip ${activePreset === p.id ? 'active' : ''}`}
+                  onClick={() => setTelemetry(p.values)}
+                >
+                  <span className={`chip-dot dot-${p.id}`} aria-hidden="true" />{p.label}
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="input-group">
-            <label htmlFor="serial_number">serial number (optional)</label>
+          <div className="field">
+            <label htmlFor="serial_number">Serial number <span className="optional">optional</span></label>
             <input
               id="serial_number" type="text" maxLength={64} placeholder="e.g. ZA1234XY"
               value={serial} onChange={e => setSerial(e.target.value)}
-              pattern="[A-Za-z0-9][A-Za-z0-9 ._\-/]{0,63}"
-              title="letters, digits, space, . _ - /"
+              pattern="[A-Za-z0-9][A-Za-z0-9 ._\-/]{0,63}" title="letters, digits, space, . _ - /"
             />
           </div>
-          {SMART_FEATURES.map((key: SmartFeature) => (
-            <div className="input-group" key={key}>
-              <label htmlFor={key}>{FEATURE_LABELS[key]}</label>
-              <input
-                id={key} type="number" min={0} max={65535} step={1} inputMode="numeric"
-                value={telemetry[key]}
-                onChange={e => setTelemetry(t => ({ ...t, [key]: clampSmart(e.target.value) }))}
-              />
-            </div>
-          ))}
-          <button type="submit" className="btn btn-primary" disabled={loading}>
-            {loading ? 'running inference...' : 'run prediction'}
-          </button>
-          {error && <p className="error-msg" role="alert">{error}</p>}
+          <div className="field-grid">
+            {SMART_FEATURES.map((key: SmartFeature) => (
+              <div className="field" key={key}>
+                <label htmlFor={key}>
+                  {FEATURE_META[key].name}
+                  <span className="code-chip">{FEATURE_META[key].code}</span>
+                </label>
+                <input
+                  id={key} type="number" min={0} max={65535} step={1} inputMode="numeric"
+                  value={telemetry[key]} aria-describedby={`${key}-hint`}
+                  onChange={e => setTelemetry(t => ({ ...t, [key]: clampSmart(e.target.value) }))}
+                />
+                <span className="field-hint" id={`${key}-hint`}>{FEATURE_META[key].hint}</span>
+              </div>
+            ))}
+          </div>
+          <div className="form-footer">
+            <button type="submit" className="btn btn-primary btn-block" disabled={loading}>
+              {loading ? <span className="spinner" aria-hidden="true" /> : <Icon name="activity" />}
+              {loading ? 'Running inference…' : 'Run prediction'}
+            </button>
+            {error && <p className="error-msg" role="alert">{error}</p>}
+          </div>
         </form>
 
-        {/* Right: Results */}
-        <div className="card" aria-live="polite">
-          <h2 className="card-title">prediction results</h2>
+        {/* Results */}
+        <section className="card" aria-live="polite" aria-label="prediction results">
+          <CardHeader title="Prediction" description={prediction?.serial_number ? `Drive ${prediction.serial_number}` : 'XGBoost accelerated-failure-time survival model.'} />
           {prediction ? (
             <>
-              <div className="metric-grid" style={{ marginBottom: '1.5rem' }}>
-                <StatCard label="remaining useful life" value={`${prediction.rul_days}d`} sub="ttf minus 30d maintenance buffer" />
-                <StatCard label="time to failure" value={`${prediction.ttf_days}d`} />
-                <div className="stat-card">
-                  <span className="stat-label">risk level</span>
-                  <RiskBadge level={prediction.risk_level} />
-                </div>
-                <StatCard label="log survival time" value={prediction.log_time} />
+              <PredictionHero p={prediction} />
+              <div className="metric-grid compact">
+                <StatCard label="time to failure" value={fmtDays(prediction.ttf_days)} />
+                <StatCard label="log survival time" value={prediction.log_time.toFixed(3)} />
+                <StatCard label="alerts fired" value={prediction.fired_alert_ids.length} tone={prediction.fired_alert_ids.length ? 'danger' : 'neutral'} />
               </div>
-              <div style={{ marginBottom: '1rem' }}>
-                <span className="stat-label">latent space novelty</span>
+              <div className="subsection">
+                <span className="field-label">latent space novelty</span>
                 <NoveltyIndicator score={prediction.novelty_score} isNovel={prediction.is_novel} />
                 {prediction.out_of_range_features.length > 0 && (
-                  <p className="muted" style={{ marginTop: '0.4rem' }}>
-                    outside probed operating range: {prediction.out_of_range_features.map(shortFeature).join(', ')}
+                  <p className="field-hint">
+                    Outside the probed operating range: {prediction.out_of_range_features.map(shortFeature).join(', ')}
                   </p>
                 )}
               </div>
-              {prediction.fired_alert_ids.length > 0 && (
-                <div className="alert-banner" role="status">
-                  ⚠ {prediction.fired_alert_ids.length} alert(s) fired — see monitoring
-                </div>
-              )}
             </>
           ) : (
-            <p className="muted">enter telemetry and run prediction.</p>
+            <EmptyState icon="activity" title="No prediction yet">
+              Choose a preset or enter SMART values, then run a prediction to estimate remaining useful life.
+            </EmptyState>
           )}
-        </div>
+        </section>
       </div>
 
-      {/* Inference history chart */}
       {history.length > 1 && (
-        <div className="card" style={{ marginTop: '1.5rem' }}>
-          <h2 className="card-title">inference timeline (last {history.length})</h2>
-          <ResponsiveContainer width="100%" height={220}>
-            <AreaChart data={historyChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+        <section className="card">
+          <CardHeader title="Session timeline" description={`Last ${history.length} predictions in this browser session.`} />
+          <ResponsiveContainer width="100%" height={240}>
+            <AreaChart data={historyChartData} margin={{ top: 10, right: 8, left: -8, bottom: 0 }}>
               <defs>
                 <linearGradient id="rulGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="var(--accent)" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="var(--accent)" stopOpacity={0} />
+                  <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.28} />
+                  <stop offset="100%" stopColor="var(--accent)" stopOpacity={0} />
                 </linearGradient>
               </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-              <XAxis dataKey="i" stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-              <YAxis yAxisId="rul" stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-              <YAxis yAxisId="nov" orientation="right" stroke="var(--text-muted)" tick={{ fontSize: 11 }} domain={[0, 'auto']} />
-              <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={{ color: 'var(--text-muted)' }} />
-              <Area yAxisId="rul" type="monotone" dataKey="rul" stroke="var(--accent)" fill="url(#rulGrad)" name="RUL (days)" dot={false} />
-              <Line yAxisId="nov" type="monotone" dataKey="novelty" stroke="var(--risk-high)" dot={false} name="novelty score" strokeDasharray="4 2" />
-              <ReferenceLine yAxisId="nov" y={1} stroke="var(--risk-critical)" strokeDasharray="6 3" label={{ value: 'novelty threshold', fill: 'var(--risk-critical)', fontSize: 10 }} />
-              <Legend wrapperStyle={{ color: 'var(--text-muted)', fontSize: 12 }} />
+              <CartesianGrid {...gridProps} />
+              <XAxis dataKey="i" {...axisProps} />
+              <YAxis yAxisId="rul" {...axisProps} />
+              <YAxis yAxisId="nov" orientation="right" {...axisProps} domain={[0, 'auto']} />
+              <Tooltip {...tooltipProps} />
+              <Area yAxisId="rul" type="monotone" dataKey="rul" stroke="var(--accent)" strokeWidth={2} fill="url(#rulGrad)" name="RUL (days)" dot={false} />
+              <Line yAxisId="nov" type="monotone" dataKey="novelty" stroke="var(--risk-high)" strokeWidth={1.5} dot={false} name="novelty score" strokeDasharray="4 3" />
+              <ReferenceLine yAxisId="nov" y={1} stroke="var(--risk-critical)" strokeDasharray="6 4" strokeOpacity={0.7} />
+              <Legend {...legendProps} />
             </AreaChart>
           </ResponsiveContainer>
-        </div>
+        </section>
       )}
     </div>
   );
@@ -218,6 +207,7 @@ const FleetTab = ({ maxBatch }: { maxBatch: number }) => {
   const [results, setResults] = useState<FleetRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [dragging, setDragging] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const onFile = async (file: File | undefined) => {
@@ -231,6 +221,12 @@ const FleetTab = ({ maxBatch }: { maxBatch: number }) => {
     const parsed = parseFleetCsv(await file.text());
     setDrives(parsed.drives);
     setParseErrors(parsed.errors);
+  };
+
+  const onDrop = (e: DragEvent<HTMLLabelElement>) => {
+    e.preventDefault();
+    setDragging(false);
+    void onFile(e.dataTransfer.files?.[0]);
   };
 
   const runScan = async () => {
@@ -271,74 +267,93 @@ const FleetTab = ({ maxBatch }: { maxBatch: number }) => {
   };
 
   return (
-    <div className="tab-content stagger-enter">
-      <div className="card">
-        <h2 className="card-title">fleet scan — batch csv upload</h2>
-        <p className="muted" style={{ marginBottom: '1rem' }}>
-          Upload a CSV of drives (columns: serial_number, drive_model and the five SMART attributes) to score
-          the whole fleet at once. Results are sorted by urgency. Files are parsed in your browser; up to 1,000 rows.
-        </p>
-        <div className="fleet-actions">
+    <div className="tab-content">
+      <section className="card">
+        <CardHeader
+          title="Fleet scan"
+          description="Score many drives at once from a CSV. Files are parsed in your browser (up to 1,000 rows)."
+          actions={
+            <>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => downloadText('fleet_template.csv', CSV_TEMPLATE)}>
+                <Icon name="file" size={14} />Template
+              </button>
+              <a className="btn btn-ghost btn-sm" href={`${API_URL}/api/models/predictions/export`} download>
+                <Icon name="download" size={14} />Export history
+              </a>
+            </>
+          }
+        />
+        <label
+          htmlFor="fleet-csv"
+          className={`dropzone ${dragging ? 'dragging' : ''} ${drives.length ? 'loaded' : ''}`}
+          onDragOver={e => { e.preventDefault(); setDragging(true); }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={onDrop}
+        >
           <input
             ref={fileInput} id="fleet-csv" type="file" accept=".csv,text/csv" className="visually-hidden"
             onChange={e => void onFile(e.target.files?.[0])}
           />
-          <button type="button" className="btn btn-ghost" onClick={() => fileInput.current?.click()}>
-            {fileName ? `📄 ${fileName}` : 'choose csv file'}
+          <span className="dropzone-icon"><Icon name={drives.length ? 'file' : 'upload'} size={22} /></span>
+          {fileName ? (
+            <span className="dropzone-title">{fileName}</span>
+          ) : (
+            <span className="dropzone-title">Drop a CSV here or <u>browse</u></span>
+          )}
+          <span className="dropzone-sub">
+            {drives.length
+              ? `${drives.length} drive${drives.length > 1 ? 's' : ''} ready to scan`
+              : 'columns: serial_number, drive_model, smart_5_raw … smart_198_raw'}
+          </span>
+        </label>
+        <div className="form-footer row">
+          <button type="button" className="btn btn-primary" disabled={!drives.length || loading} onClick={runScan}>
+            {loading ? <span className="spinner" aria-hidden="true" /> : <Icon name="server" />}
+            {loading ? 'Scanning…' : drives.length ? `Scan ${drives.length} drive${drives.length > 1 ? 's' : ''}` : 'Scan fleet'}
           </button>
-          <button type="button" className="btn btn-ghost" onClick={() => downloadText('fleet_template.csv', CSV_TEMPLATE)}>
-            download template
-          </button>
-          <a className="btn btn-ghost" href={`${API_URL}/api/models/predictions/export`} download>
-            export prediction history
-          </a>
-          <button type="button" className="btn btn-primary" style={{ marginTop: 0 }} disabled={!drives.length || loading} onClick={runScan}>
-            {loading ? 'scanning...' : drives.length ? `scan ${drives.length} drive${drives.length > 1 ? 's' : ''}` : 'scan fleet'}
-          </button>
+          {error && <p className="error-msg" role="alert">{error}</p>}
         </div>
         {parseErrors.length > 0 && (
           <ul className="error-list" role="alert">
             {parseErrors.map(e => <li key={e}>{e}</li>)}
           </ul>
         )}
-        {error && <p className="error-msg" role="alert">{error}</p>}
-      </div>
+      </section>
 
       {results.length > 0 && (
         <>
           <div className="metric-grid">
-            {(['critical', 'high', 'medium', 'low'] as RiskLevel[]).map(tier => (
-              <div className="stat-card" key={tier}>
-                <span className="stat-label">{tier} risk</span>
-                <span className={`stat-value risk-text-${tier}`}>{counts[tier]}</span>
-              </div>
+            {RISK_TIERS.map(tier => (
+              <StatCard key={tier} label={`${tier} risk`} value={counts[tier]} tone={tier}
+                sub={`${Math.round((counts[tier] / results.length) * 100)}% of fleet`} />
             ))}
-            <StatCard label="novel inputs" value={results.filter(r => r.is_novel).length} sub="outside training distribution" />
+            <StatCard label="novel inputs" value={results.filter(r => r.is_novel).length} sub="outside training distribution" tone="accent" />
           </div>
-          <div className="card">
-            <div className="card-title-row">
-              <h2 className="card-title">scan results ({results.length})</h2>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={exportResults}>download results</button>
-            </div>
+          <section className="card flush">
+            <CardHeader
+              title={`Results · ${results.length} drives`}
+              description="Sorted by urgency: highest risk and shortest remaining life first."
+              actions={<button type="button" className="btn btn-ghost btn-sm" onClick={exportResults}><Icon name="download" size={14} />Download</button>}
+            />
             <div className="table-wrap">
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th scope="col">row</th><th scope="col">serial</th><th scope="col">model</th>
+                    <th scope="col">#</th><th scope="col">serial</th><th scope="col">model</th>
                     <th scope="col">risk</th><th scope="col" className="num">rul</th>
                     <th scope="col" className="num">ttf</th><th scope="col" className="num">novelty</th>
                   </tr>
                 </thead>
                 <tbody>
                   {results.map(r => (
-                    <tr key={r.row}>
-                      <td className="mono">{r.row}</td>
-                      <td className="mono">{r.serial_number ?? '—'}</td>
+                    <tr key={r.row} className={`row-${r.risk_level}`}>
+                      <td className="mono dim">{r.row}</td>
+                      <td className="mono strong">{r.serial_number ?? '—'}</td>
                       <td>{r.drive_model ?? '—'}</td>
                       <td><RiskBadge level={r.risk_level} /></td>
-                      <td className="num mono">{r.rul_days}d</td>
-                      <td className="num mono">{r.ttf_days}d</td>
-                      <td className={`num mono ${r.is_novel ? 'risk-text-critical' : ''}`}>
+                      <td className="num mono strong">{fmtDays(r.rul_days)}</td>
+                      <td className="num mono">{fmtDays(r.ttf_days)}</td>
+                      <td className={`num mono ${r.is_novel ? 'text-danger' : ''}`}>
                         {r.novelty_score === null ? '—' : r.novelty_score.toFixed(2)}
                       </td>
                     </tr>
@@ -346,7 +361,7 @@ const FleetTab = ({ maxBatch }: { maxBatch: number }) => {
                 </tbody>
               </table>
             </div>
-          </div>
+          </section>
         </>
       )}
     </div>
@@ -354,6 +369,8 @@ const FleetTab = ({ maxBatch }: { maxBatch: number }) => {
 };
 
 // ─── Monitoring Tab ───────────────────────────────────────────────────────────
+
+const STATUS_TONE: Record<string, Tone> = { healthy: 'success', degraded: 'warning', unavailable: 'danger' };
 
 const MonitoringTab = ({ health, alerts, summary, driftHistory, alertFilter, onAlertFilter, onResolve }: {
   health: HealthData | null;
@@ -385,141 +402,170 @@ const MonitoringTab = ({ health, alerts, summary, driftHistory, alertFilter, onA
   };
 
   return (
-    <div className="tab-content stagger-enter">
-      {/* System health summary */}
-      <div className="metric-grid" style={{ marginBottom: '1.5rem' }}>
+    <div className="tab-content">
+      <div className="metric-grid">
         <StatCard
-          label="system status"
+          label="system status" tone={STATUS_TONE[health?.status ?? ''] ?? 'neutral'}
           value={health?.status || '—'}
-          sub={health?.status === 'healthy' ? '✓ all systems nominal' : health ? '⚠ attention needed' : 'connecting...'}
+          sub={health?.status === 'healthy' ? 'all systems nominal' : health ? 'attention needed' : 'connecting…'}
         />
-        <StatCard label="total inferences" value={health?.total_inferences ?? 0} sub="since last restart" />
-        <StatCard label="active alerts" value={health?.alerts?.total_active ?? 0} sub={`${health?.alerts?.critical_count ?? 0} critical`} />
+        <StatCard label="inferences" value={(health?.total_inferences ?? 0).toLocaleString()} sub="since last restart" />
         <StatCard
-          label="faiss index"
-          value={health?.faiss?.is_built ? 'built' : 'not built'}
-          sub={health?.faiss?.threshold ? `threshold: ${health.faiss.threshold.toFixed(4)}` : ''}
+          label="active alerts" value={health?.alerts?.total_active ?? 0}
+          tone={(health?.alerts?.critical_count ?? 0) > 0 ? 'danger' : (health?.alerts?.total_active ?? 0) > 0 ? 'warning' : 'neutral'}
+          sub={`${health?.alerts?.critical_count ?? 0} critical`}
+        />
+        <StatCard
+          label="novelty index" value={health?.faiss?.is_built ? 'ready' : 'not built'}
+          tone={health?.faiss?.is_built ? 'accent' : 'warning'}
+          sub={health?.faiss?.threshold ? `threshold ${health.faiss.threshold.toFixed(3)}` : ''}
         />
       </div>
 
       {summary && summary.total_predictions > 0 && (
-        <div className="card">
-          <h2 className="card-title">prediction history (all time)</h2>
-          <div className="metric-grid" style={{ marginBottom: 0 }}>
-            <StatCard label="predictions stored" value={summary.total_predictions} />
-            <StatCard label="tracked drives" value={summary.tracked_drives} sub="with a serial number" />
-            <StatCard label="mean rul" value={summary.mean_rul_days !== null ? `${summary.mean_rul_days}d` : '—'} />
-            <StatCard label="novelty rate" value={`${(summary.novelty_rate * 100).toFixed(1)}%`} />
-          </div>
-        </div>
-      )}
-
-      {/* Drift Charts */}
-      {driftData.length > 0 ? (
-        <div className="card">
-          <h2 className="card-title">per-feature drift scores (ks + psi)</h2>
-          <p className="muted" style={{ marginBottom: '1rem' }}>
-            KS statistic and PSI per SMART feature vs. baseline LHS probe distribution.
-            PSI &gt; 0.25 triggers a FEATURE_DRIFT alert.
-          </p>
-          <ResponsiveContainer width="100%" height={240}>
-            <BarChart data={driftData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-              <XAxis dataKey="name" stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-              <YAxis stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-              <Tooltip contentStyle={TOOLTIP_STYLE} />
-              <ReferenceLine y={0.25} stroke="var(--risk-critical)" strokeDasharray="4 2" label={{ value: 'PSI drift threshold', fill: 'var(--risk-critical)', fontSize: 10 }} />
-              <Bar dataKey="psi" name="PSI" fill="var(--accent)" radius={[3, 3, 0, 0]} />
-              <Bar dataKey="ks" name="KS statistic" fill="var(--accent-dim)" radius={[3, 3, 0, 0]} />
-              <Legend wrapperStyle={{ color: 'var(--text-muted)', fontSize: 12 }} />
-            </BarChart>
-          </ResponsiveContainer>
-          <div className="drift-feature-grid">
-            {health?.drift?.feature_scores?.map(fs => (
-              <div key={fs.feature} className={`drift-chip severity-${fs.severity}`}>
-                <span>{fs.feature.replace('_raw', '')}</span>
-                <span className="drift-chip-val">{fs.severity}</span>
+        <section className="card">
+          <CardHeader title="Prediction history" description="All predictions stored in the database." />
+          <div className="summary-row">
+            <div className="summary-stats">
+              <StatCard label="stored" value={summary.total_predictions.toLocaleString()} />
+              <StatCard label="tracked drives" value={summary.tracked_drives} sub="with a serial number" />
+              <StatCard label="mean rul" value={summary.mean_rul_days !== null ? fmtDays(summary.mean_rul_days) : '—'} />
+              <StatCard label="novelty rate" value={`${(summary.novelty_rate * 100).toFixed(1)}%`} />
+            </div>
+            <div className="stacked-bar-wrap">
+              <span className="field-label">risk mix</span>
+              <div className="stacked-bar" role="img"
+                aria-label={RISK_TIERS.map(t => `${t} ${summary.risk_counts[t]}`).join(', ')}>
+                {RISK_TIERS.map(t => summary.risk_counts[t] > 0 && (
+                  <span key={t} className={`seg seg-${t}`} style={{ flexGrow: summary.risk_counts[t] }}
+                    title={`${t}: ${summary.risk_counts[t]}`} />
+                ))}
               </div>
-            ))}
+              <div className="legend-row">
+                {RISK_TIERS.map(t => (
+                  <span key={t} className="legend-item"><span className={`legend-dot seg-${t}`} />{t} <b>{summary.risk_counts[t]}</b></span>
+                ))}
+              </div>
+            </div>
           </div>
-        </div>
-      ) : (
-        <div className="card">
-          <h2 className="card-title">per-feature drift scores (ks + psi)</h2>
-          <p className="muted">
-            collecting samples — drift statistics appear after 30 inferences
-            ({health?.drift_window_count ?? 0}/30 in the window).
-          </p>
-        </div>
+        </section>
       )}
 
-      {trendData.length > 1 && (
-        <div className="card">
-          <h2 className="card-title">psi trend (persisted drift snapshots)</h2>
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={trendData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-              <XAxis dataKey="i" stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-              <YAxis stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-              <Tooltip contentStyle={TOOLTIP_STYLE} />
-              <ReferenceLine y={0.25} stroke="var(--risk-critical)" strokeDasharray="4 2" />
-              {SMART_FEATURES.map((f, i) => (
-                <Line key={f} type="monotone" dataKey={shortFeature(f)} stroke={FEATURE_COLORS[i]} dot={false} />
+      <div className="split">
+        <section className="card">
+          <CardHeader title="Feature drift" description="KS statistic and PSI vs. the probe baseline. PSI above 0.25 raises a FEATURE_DRIFT alert." />
+          {driftData.length > 0 ? (
+            <>
+              <ResponsiveContainer width="100%" height={230}>
+                <BarChart data={driftData} margin={{ top: 8, right: 8, left: -12, bottom: 0 }} barGap={3}>
+                  <CartesianGrid {...gridProps} />
+                  <XAxis dataKey="name" {...axisProps} />
+                  <YAxis {...axisProps} />
+                  <Tooltip {...tooltipProps} />
+                  <ReferenceLine y={0.25} stroke="var(--risk-critical)" strokeDasharray="5 4" strokeOpacity={0.8} />
+                  <Bar dataKey="psi" name="PSI" fill="var(--accent)" radius={[4, 4, 0, 0]} maxBarSize={28} isAnimationActive={false} />
+                  <Bar dataKey="ks" name="KS" fill="var(--accent-soft-strong)" radius={[4, 4, 0, 0]} maxBarSize={28} isAnimationActive={false} />
+                  <Legend {...legendProps} />
+                </BarChart>
+              </ResponsiveContainer>
+              <div className="chip-row">
+                {health?.drift?.feature_scores?.map(fs => (
+                  <span key={fs.feature} className={`status-chip sev-${fs.severity}`}>
+                    {shortFeature(fs.feature)} · {fs.severity}
+                  </span>
+                ))}
+              </div>
+            </>
+          ) : (
+            <EmptyState icon="pulse" title="Collecting samples">
+              Drift statistics appear after 30 inferences ({health?.drift_window_count ?? 0}/30 in the window).
+            </EmptyState>
+          )}
+        </section>
+
+        <section className="card">
+          <CardHeader title="PSI trend" description="Persisted drift snapshots over time." />
+          {trendData.length > 1 ? (
+            <ResponsiveContainer width="100%" height={262}>
+              <LineChart data={trendData} margin={{ top: 8, right: 8, left: -12, bottom: 0 }}>
+                <CartesianGrid {...gridProps} />
+                <XAxis dataKey="i" {...axisProps} />
+                <YAxis {...axisProps} />
+                <Tooltip {...tooltipProps} />
+                <ReferenceLine y={0.25} stroke="var(--risk-critical)" strokeDasharray="5 4" strokeOpacity={0.8} />
+                {SMART_FEATURES.map((f, i) => (
+                  <Line key={f} type="monotone" dataKey={shortFeature(f)} stroke={SERIES_COLORS[i]} strokeWidth={2} dot={false} isAnimationActive={false} />
+                ))}
+                <Legend {...legendProps} />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <EmptyState icon="activity" title="Not enough snapshots yet">
+              A snapshot is stored every drift-check interval. The trend appears after two.
+            </EmptyState>
+          )}
+        </section>
+      </div>
+
+      <section className="card">
+        <CardHeader
+          title={alertFilter === 'active' ? 'Active alerts' : 'Alert history'}
+          description="Repeat occurrences update a single alert and escalate it to CRITICAL."
+          actions={
+            <div className="segmented" role="group" aria-label="alert filter">
+              {(['active', 'all'] as const).map(f => (
+                <button
+                  type="button" key={f} aria-pressed={alertFilter === f}
+                  className={`seg-btn ${alertFilter === f ? 'active' : ''}`}
+                  onClick={() => onAlertFilter(f)}
+                >
+                  {f}
+                </button>
               ))}
-              <Legend wrapperStyle={{ color: 'var(--text-muted)', fontSize: 12 }} />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-
-      {/* Alerts */}
-      <div className="card">
-        <div className="card-title-row">
-          <h2 className="card-title">{alertFilter === 'active' ? 'active alerts' : 'alert history'}</h2>
-          <div className="segmented" role="group" aria-label="alert filter">
-            {(['active', 'all'] as const).map(f => (
-              <button
-                type="button" key={f} aria-pressed={alertFilter === f}
-                className={`seg-btn ${alertFilter === f ? 'active' : ''}`}
-                onClick={() => onAlertFilter(f)}
-              >
-                {f}
-              </button>
-            ))}
-          </div>
-        </div>
+            </div>
+          }
+        />
         {resolveError && <p className="error-msg" role="alert" style={{ marginBottom: '0.75rem' }}>{resolveError}</p>}
         {alerts.length === 0 ? (
-          <p className="muted">{alertFilter === 'active' ? 'no active alerts — system is nominal.' : 'no alerts recorded yet.'}</p>
+          <EmptyState icon="check" title={alertFilter === 'active' ? 'All clear' : 'No alerts recorded'}>
+            {alertFilter === 'active' ? 'No active alerts. The model is operating within its expected envelope.' : 'Alerts will appear here once they fire.'}
+          </EmptyState>
         ) : (
-          <div className="alert-list">
+          <ul className="alert-list">
             {alerts.map(a => (
-              <div key={a.id} className={`alert-item alert-${a.alert_type.toLowerCase()} severity-${a.severity.toLowerCase()} ${a.status === 'RESOLVED' ? 'resolved' : ''}`}>
-                <div className="alert-header">
-                  <span className="alert-type-badge">{a.alert_type}</span>
-                  <span className={`alert-severity ${a.severity.toLowerCase()}`}>{a.severity}</span>
-                  {a.status === 'RESOLVED' && <span className="alert-resolved-tag">resolved</span>}
+              <li key={a.id} className={`alert-item sev-${a.severity.toLowerCase()} ${a.status === 'RESOLVED' ? 'resolved' : ''}`}>
+                <span className="alert-icon"><Icon name={a.status === 'RESOLVED' ? 'check' : 'alert'} size={16} /></span>
+                <div className="alert-body">
+                  <div className="alert-header">
+                    <span className="alert-type">{a.alert_type.replace('_', ' ').toLowerCase()}</span>
+                    <span className={`pill pill-${a.severity.toLowerCase()}`}>{a.severity}</span>
+                    {a.status === 'RESOLVED' && <span className="pill pill-resolved">resolved</span>}
+                    {a.occurrences > 1 && <span className="alert-count">×{a.occurrences}</span>}
+                  </div>
+                  <p className="alert-msg">{a.message}</p>
+                </div>
+                <div className="alert-side">
                   <time className="alert-time" dateTime={a.updated_at ?? a.created_at}>
-                    {new Date(a.updated_at ?? a.created_at).toLocaleTimeString()}
+                    {new Date(a.updated_at ?? a.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </time>
                   {a.status === 'ACTIVE' && (
-                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => void resolve(a.id)}>resolve</button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => void resolve(a.id)}>Resolve</button>
                   )}
                 </div>
-                <p className="alert-msg">{a.message}</p>
-                {a.occurrences > 1 && (
-                  <p className="alert-escalation">seen {a.occurrences}× — escalated {a.escalation_count}×</p>
-                )}
-              </div>
+              </li>
             ))}
-          </div>
+          </ul>
         )}
-      </div>
+      </section>
     </div>
   );
 };
 
 // ─── Model Autopsy Tab ────────────────────────────────────────────────────────
+
+const TIER_COLOR: Record<string, string> = {
+  low: 'var(--risk-low)', medium: 'var(--risk-medium)', high: 'var(--risk-high)', critical: 'var(--risk-critical)',
+};
 
 const AutopsyTab = ({ fingerprint, onProbed }: { fingerprint: Fingerprint | null; onProbed: () => void }) => {
   const [topology, setTopology] = useState<Topology | null>(null);
@@ -532,14 +578,11 @@ const AutopsyTab = ({ fingerprint, onProbed }: { fingerprint: Fingerprint | null
       const data = await apiFetch<{
         fingerprint_id: string; novelty_threshold: number | null; wasserstein_to_previous: number | null;
       }>('/api/models/probe', { method: 'POST', admin: true });
-      const shift = data.wasserstein_to_previous !== null ? ` | baseline shift (W1): ${data.wasserstein_to_previous.toFixed(2)}` : '';
-      setProbeResult({
-        ok: true,
-        text: `probe complete — fingerprint: ${data.fingerprint_id} | threshold: ${data.novelty_threshold?.toFixed(4)}${shift}`,
-      });
+      const shift = data.wasserstein_to_previous !== null ? ` · baseline shift W1 ${data.wasserstein_to_previous.toFixed(2)}` : '';
+      setProbeResult({ ok: true, text: `Fingerprint ${data.fingerprint_id} · threshold ${data.novelty_threshold?.toFixed(3)}${shift}` });
       onProbed();
     } catch (err) {
-      setProbeResult({ ok: false, text: `probe failed — ${errorMessage(err)}` });
+      setProbeResult({ ok: false, text: `Probe failed — ${errorMessage(err)}` });
     } finally {
       setLoadingProbe(false);
     }
@@ -555,7 +598,7 @@ const AutopsyTab = ({ fingerprint, onProbed }: { fingerprint: Fingerprint | null
 
   const histogramData = fingerprint?.histogram?.bins?.map((bin, i) => ({
     day: Math.round(bin), count: fingerprint.histogram.counts[i] || 0,
-  })).filter(d => d.count > 0) || [];
+  })) || [];
 
   const featureImportanceData = Object.entries(fingerprint?.feature_importance || {}).map(([feat, val]) => ({
     name: shortFeature(feat),
@@ -563,102 +606,104 @@ const AutopsyTab = ({ fingerprint, onProbed }: { fingerprint: Fingerprint | null
   })).sort((a, b) => b.importance - a.importance);
 
   return (
-    <div className="tab-content stagger-enter">
-      <div className="card">
-        <h2 className="card-title">model autopsy & fingerprint</h2>
-        <p className="muted" style={{ marginBottom: '1rem' }}>
-          Run a 500-sample Latin Hypercube Sampling probe across the full SMART feature space.
-          This rebuilds the FAISS novelty index and behavioral fingerprint. Requires the admin key.
-        </p>
-        <button type="button" className="btn btn-primary" onClick={runProbe} disabled={loadingProbe}>
-          {loadingProbe ? 'probing...' : 'run lhs probe sweep'}
-        </button>
+    <div className="tab-content">
+      <section className="card">
+        <CardHeader
+          title="Model autopsy"
+          description="A Latin Hypercube probe sweep across the SMART feature space rebuilds the novelty index and behavioral fingerprint. Requires the admin key."
+          actions={
+            <button type="button" className="btn btn-primary" onClick={runProbe} disabled={loadingProbe}>
+              {loadingProbe ? <span className="spinner" aria-hidden="true" /> : <Icon name="spark" />}
+              {loadingProbe ? 'Probing…' : 'Run probe sweep'}
+            </button>
+          }
+        />
         {probeResult && (
-          <p className={probeResult.ok ? 'success-msg' : 'error-msg'} role="status" style={{ marginTop: '0.75rem' }}>
-            {probeResult.text}
+          <p className={`notice ${probeResult.ok ? 'notice-success' : 'notice-error'}`} role="status">
+            <Icon name={probeResult.ok ? 'check' : 'alert'} size={15} />{probeResult.text}
           </p>
         )}
-      </div>
+        {fingerprint && (
+          <div className="metric-grid compact" style={{ marginTop: probeResult ? '1rem' : 0 }}>
+            <StatCard label="fingerprint" value={<span className="mono small">{fingerprint.fingerprint_id}</span>} />
+            <StatCard label="probe samples" value={fingerprint.n_probe_samples} />
+            <StatCard label="prediction entropy" value={fingerprint.prediction_entropy.toFixed(3)} sub="0 concentrated · 1 max spread" />
+            <StatCard label="uncertainty rate" value={`${(fingerprint.uncertainty_rate * 100).toFixed(1)}%`} sub="probes predicting < 90 days" />
+          </div>
+        )}
+      </section>
 
       {fingerprint && (
         <>
-          {/* Fingerprint summary */}
-          <div className="metric-grid">
-            <StatCard label="fingerprint id" value={fingerprint.fingerprint_id} />
-            <StatCard label="probe samples" value={fingerprint.n_probe_samples} />
-            <StatCard label="prediction entropy" value={fingerprint.prediction_entropy.toFixed(3)} sub="0=concentrated, 1=max spread" />
-            <StatCard label="uncertainty rate" value={`${(fingerprint.uncertainty_rate * 100).toFixed(1)}%`} sub="fraction predicting <90d" />
-          </div>
-
-          {/* RUL histogram */}
-          <div className="card">
-            <h2 className="card-title">rul prediction histogram (lhs probe)</h2>
-            <div className="rul-distribution-row" style={{ marginBottom: '1rem' }}>
+          <section className="card">
+            <CardHeader title="Predicted time-to-failure distribution" description="Model output across the probe sweep (clipped at 3,000 days)." />
+            <div className="pill-stats">
               {[
-                { l: 'mean', v: fingerprint.rul_distribution.mean.toFixed(0) + 'd' },
-                { l: 'p10', v: fingerprint.rul_distribution.p10.toFixed(0) + 'd' },
-                { l: 'median', v: fingerprint.rul_distribution.median.toFixed(0) + 'd' },
-                { l: 'p90', v: fingerprint.rul_distribution.p90.toFixed(0) + 'd' },
-              ].map(({ l, v }) => <StatCard key={l} label={l} value={v} />)}
+                { l: 'p10', v: fingerprint.rul_distribution.p10 },
+                { l: 'median', v: fingerprint.rul_distribution.median },
+                { l: 'mean', v: fingerprint.rul_distribution.mean },
+                { l: 'p90', v: fingerprint.rul_distribution.p90 },
+              ].map(({ l, v }) => (
+                <span key={l} className="pill-stat"><span>{l} rul</span><b className="mono">{fmtDays(v)}</b></span>
+              ))}
             </div>
-            <ResponsiveContainer width="100%" height={200}>
-              <BarChart data={histogramData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                <XAxis dataKey="day" stroke="var(--text-muted)" tick={{ fontSize: 10 }} label={{ value: 'days', position: 'insideBottomRight', fill: 'var(--text-muted)', fontSize: 11 }} />
-                <YAxis stroke="var(--text-muted)" tick={{ fontSize: 11 }} />
-                <Tooltip contentStyle={TOOLTIP_STYLE} />
-                <Bar dataKey="count" fill="var(--accent)" radius={[2, 2, 0, 0]} />
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={histogramData} margin={{ top: 8, right: 8, left: -12, bottom: 0 }} barCategoryGap={1}>
+                <CartesianGrid {...gridProps} />
+                <XAxis dataKey="day" {...axisProps} interval="preserveStartEnd" minTickGap={24} tickFormatter={v => `${v}d`} />
+                <YAxis {...axisProps} allowDecimals={false} />
+                <Tooltip {...tooltipProps} labelFormatter={v => `≈ ${v} days`} />
+                <Bar dataKey="count" name="probes" fill="var(--accent)" radius={[3, 3, 0, 0]} isAnimationActive={false} />
               </BarChart>
             </ResponsiveContainer>
-          </div>
+          </section>
 
-          {/* Feature importance */}
-          <div className="two-col">
-            <div className="card">
-              <h2 className="card-title">feature importance (gain)</h2>
-              <ResponsiveContainer width="100%" height={200}>
-                <BarChart data={featureImportanceData} layout="vertical" margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" horizontal={false} />
-                  <XAxis type="number" stroke="var(--text-muted)" tick={{ fontSize: 11 }} tickFormatter={v => `${v}%`} />
-                  <YAxis type="category" dataKey="name" stroke="var(--text-muted)" tick={{ fontSize: 11 }} width={40} />
-                  <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(v) => `${v}%`} />
-                  <Bar dataKey="importance" fill="var(--accent)" radius={[0, 3, 3, 0]} />
+          <div className="split">
+            <section className="card">
+              <CardHeader title="Feature importance" description="Share of total split gain per SMART attribute." />
+              <ResponsiveContainer width="100%" height={210}>
+                <BarChart data={featureImportanceData} layout="vertical" margin={{ top: 4, right: 16, left: 0, bottom: 0 }}>
+                  <CartesianGrid {...gridProps} vertical horizontal={false} />
+                  <XAxis type="number" {...axisProps} tickFormatter={v => `${v}%`} />
+                  <YAxis type="category" dataKey="name" {...axisProps} width={44} />
+                  <Tooltip {...tooltipProps} formatter={(v) => [`${v}%`, 'gain share']} />
+                  <Bar dataKey="importance" fill="var(--accent)" radius={[0, 4, 4, 0]} maxBarSize={22} isAnimationActive={false}>
+                    {featureImportanceData.map((d, i) => (
+                      <Cell key={d.name} fillOpacity={1 - i * 0.14} />
+                    ))}
+                  </Bar>
                 </BarChart>
               </ResponsiveContainer>
-            </div>
+            </section>
 
-            {/* Class bias */}
-            <div className="card">
-              <h2 className="card-title">risk tier distribution (class bias)</h2>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '1rem' }}>
+            <section className="card">
+              <CardHeader title="Risk tier distribution" description="Share of probes landing in each tier (class bias)." />
+              <div className="bias-list">
                 {Object.entries(fingerprint.class_bias).map(([tier, frac]) => (
-                  <div key={tier}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                      <RiskBadge level={tier} />
-                      <span className="muted">{(frac * 100).toFixed(1)}%</span>
+                  <div key={tier} className="bias-row">
+                    <RiskBadge level={tier} />
+                    <div className="bias-track">
+                      <div className="bias-fill" style={{ width: `${frac * 100}%`, background: TIER_COLOR[tier] }} />
                     </div>
-                    <div className="bias-bar-track">
-                      <div className={`bias-bar-fill bias-${tier}`} style={{ width: `${frac * 100}%` }} />
-                    </div>
+                    <span className="mono bias-pct">{(frac * 100).toFixed(1)}%</span>
                   </div>
                 ))}
               </div>
-            </div>
+            </section>
           </div>
         </>
       )}
 
-      {/* XGBoost Topology */}
       {topology && (
-        <div className="card">
-          <h2 className="card-title">xgboost ensemble topology</h2>
-          <div className="metric-grid" style={{ marginBottom: '1.5rem' }}>
-            <StatCard label="n trees" value={topology.n_trees || 0} />
-            <StatCard label="total nodes" value={topology.total_nodes || 0} />
-            <StatCard label="total leaves" value={topology.total_leaves || 0} />
-            <StatCard label="max depth" value={topology.max_depth || 0} />
+        <section className="card">
+          <CardHeader title="Ensemble topology" description="Structure of the gradient-boosted tree ensemble." />
+          <div className="metric-grid compact">
+            <StatCard label="trees" value={topology.n_trees.toLocaleString()} />
+            <StatCard label="nodes" value={topology.total_nodes.toLocaleString()} />
+            <StatCard label="leaves" value={topology.total_leaves.toLocaleString()} />
+            <StatCard label="max depth" value={topology.max_depth} />
           </div>
-          <div className="topology-trees">
+          <div className="tree-row">
             {(topology.tree_summaries || []).map(t => (
               <div key={t.tree_id} className="tree-chip">
                 <span className="tree-id">tree {t.tree_id}</span>
@@ -666,7 +711,7 @@ const AutopsyTab = ({ fingerprint, onProbed }: { fingerprint: Fingerprint | null
               </div>
             ))}
           </div>
-        </div>
+        </section>
       )}
     </div>
   );
@@ -685,24 +730,24 @@ const AdminPanel = ({ adminEnabled, onClose }: { adminEnabled: boolean | null; o
   };
 
   return (
-    <form className="admin-panel card" onSubmit={save} aria-label="admin access">
-      <div className="input-group" style={{ marginBottom: 0, flex: 1 }}>
-        <label htmlFor="admin-key">admin api key</label>
+    <form className="admin-panel" onSubmit={save} aria-label="admin access">
+      <span className="admin-icon"><Icon name="lock" size={18} /></span>
+      <div className="field admin-field">
+        <label htmlFor="admin-key">Admin API key</label>
         <input
           id="admin-key" type="password" autoComplete="off" value={value}
           onChange={e => { setValue(e.target.value); setSaved(false); }}
           placeholder="required for probe sweeps and resolving alerts"
         />
+        <span className="field-hint">
+          {saved ? '✓ Saved for this tab. ' : ''}Kept in session storage only and cleared when the tab closes.
+          {adminEnabled === false && ' The server has no admin key configured, so admin actions are disabled.'}
+        </span>
       </div>
       <div className="admin-actions">
-        <button type="submit" className="btn btn-primary" style={{ marginTop: 0 }}>{value ? 'save' : 'clear'}</button>
-        <button type="button" className="btn btn-ghost" onClick={onClose}>close</button>
+        <button type="submit" className="btn btn-primary">{value ? 'Save' : 'Clear'}</button>
+        <button type="button" className="btn btn-ghost" onClick={onClose}>Close</button>
       </div>
-      <p className="muted admin-note">
-        {saved ? '✓ saved for this browser tab. ' : ''}
-        stored in session storage only — cleared when the tab closes.
-        {adminEnabled === false && ' note: the server has no admin key configured, so admin actions are disabled.'}
-      </p>
     </form>
   );
 };
@@ -711,11 +756,11 @@ const AdminPanel = ({ adminEnabled, onClose }: { adminEnabled: boolean | null; o
 
 type TabId = 'inference' | 'fleet' | 'monitoring' | 'autopsy';
 
-const TABS: Array<{ id: TabId; label: string }> = [
-  { id: 'inference', label: 'inference' },
-  { id: 'fleet', label: 'fleet scan' },
-  { id: 'monitoring', label: 'monitoring' },
-  { id: 'autopsy', label: 'model autopsy' },
+const TABS: Array<{ id: TabId; label: string; icon: IconName }> = [
+  { id: 'inference', label: 'Inference', icon: 'activity' },
+  { id: 'fleet', label: 'Fleet scan', icon: 'server' },
+  { id: 'monitoring', label: 'Monitoring', icon: 'pulse' },
+  { id: 'autopsy', label: 'Model autopsy', icon: 'layers' },
 ];
 
 export default function DataCenterGuardian() {
@@ -729,6 +774,13 @@ export default function DataCenterGuardian() {
   const [driftHistory, setDriftHistory] = useState<DriftSnapshot[]>([]);
   const [meta, setMeta] = useState<ApiMeta | null>(null);
   const [showAdmin, setShowAdmin] = useState(false);
+  const [theme, setTheme] = useState<ThemeMode>(initialTheme);
+
+  const toggleTheme = () => {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next, true);
+    setTheme(next);
+  };
 
   const refresh = useCallback(async () => {
     const results = await Promise.allSettled([
@@ -776,76 +828,99 @@ export default function DataCenterGuardian() {
 
   const criticalCount = health?.alerts?.critical_count || 0;
   const activeAlertCount = health?.alerts?.total_active || 0;
-  const statusLabel = online === false ? 'offline' : health?.status || 'connecting...';
-  const statusColor = online === false ? 'red' : health?.status === 'healthy' ? 'green' : health ? 'amber' : 'grey';
+  const statusLabel = online === false ? 'offline' : health?.status || 'connecting';
+  const statusTone = online === false ? 'danger' : health?.status === 'healthy' ? 'success' : health ? 'warning' : 'neutral';
 
   return (
-    <div className="dashboard-container">
-      <a href="#main" className="skip-link">skip to content</a>
-      <header className="header">
-        <div>
-          <h1 className="title">data center guardian</h1>
-          <p className="subtitle">predictive maintenance · mlops observability platform</p>
-        </div>
-        <div className="header-right">
-          {activeAlertCount > 0 && (
-            <button
-              type="button"
-              className={`global-alert-badge ${criticalCount > 0 ? 'critical' : 'warning'}`}
-              onClick={() => setActiveTab('monitoring')}
-            >
-              {criticalCount > 0 ? '🔴' : '🟡'} {activeAlertCount} alert{activeAlertCount > 1 ? 's' : ''} active
-            </button>
-          )}
-          <span className="status-wrap" title={statusLabel}>
-            <span className={`status-dot ${statusColor}`} aria-hidden="true" />
-            <span className="status-text">{statusLabel}</span>
-          </span>
-          <button
-            type="button" className={`btn btn-ghost btn-sm ${showAdmin ? 'active' : ''}`}
-            aria-expanded={showAdmin} onClick={() => setShowAdmin(s => !s)}
-          >
-            🔒 admin
-          </button>
-          <nav className="tabs" role="tablist" aria-label="dashboard sections">
-            {TABS.map(t => (
+    <div className="app">
+      <a href="#main" className="skip-link">Skip to content</a>
+
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="brand">
+            <span className="brand-mark"><Icon name="logo" size={20} /></span>
+            <div>
+              <h1 className="brand-name">Data Center Guardian</h1>
+              <p className="brand-sub">Predictive maintenance · MLOps observability</p>
+            </div>
+          </div>
+          <div className="topbar-actions">
+            {activeAlertCount > 0 && (
               <button
-                key={t.id} type="button" role="tab" id={`tab-${t.id}`}
-                aria-selected={activeTab === t.id} aria-controls="main"
-                className={`tab-btn ${activeTab === t.id ? 'active' : ''}`}
-                onClick={() => setActiveTab(t.id)}
+                type="button" className={`status-chip ${criticalCount > 0 ? 'tone-danger' : 'tone-warning'} clickable`}
+                onClick={() => setActiveTab('monitoring')}
               >
-                {t.label}
+                <Icon name="alert" size={13} />
+                {activeAlertCount} alert{activeAlertCount > 1 ? 's' : ''}
               </button>
-            ))}
-          </nav>
+            )}
+            <span className={`status-chip tone-${statusTone}`} role="status">
+              <span className="status-dot" aria-hidden="true" />{statusLabel}
+            </span>
+            <button
+              type="button" className={`icon-btn ${showAdmin ? 'active' : ''}`}
+              aria-expanded={showAdmin} aria-label="admin access" title="Admin access"
+              onClick={() => setShowAdmin(s => !s)}
+            >
+              <Icon name="lock" />
+            </button>
+            <button
+              type="button" className="icon-btn" onClick={toggleTheme}
+              aria-label={`switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+            >
+              <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
+            </button>
+          </div>
         </div>
+        <nav className="tabbar" role="tablist" aria-label="dashboard sections">
+          {TABS.map(t => (
+            <button
+              key={t.id} type="button" role="tab" id={`tab-${t.id}`}
+              aria-selected={activeTab === t.id} aria-controls="main"
+              className={`tab ${activeTab === t.id ? 'active' : ''}`}
+              onClick={() => setActiveTab(t.id)}
+            >
+              <Icon name={t.icon} size={15} />
+              {t.label}
+              {t.id === 'monitoring' && activeAlertCount > 0 && (
+                <span className={`tab-badge ${criticalCount > 0 ? 'critical' : ''}`}>{activeAlertCount}</span>
+              )}
+            </button>
+          ))}
+        </nav>
       </header>
 
-      {showAdmin && <AdminPanel adminEnabled={meta ? meta.admin_enabled : null} onClose={() => setShowAdmin(false)} />}
+      <div className="page">
+        {showAdmin && <AdminPanel adminEnabled={meta ? meta.admin_enabled : null} onClose={() => setShowAdmin(false)} />}
 
-      {online === false && (
-        <div className="offline-banner" role="status">
-          cannot reach the inference server — retrying every {POLL_MS / 1000}s.
-        </div>
-      )}
-
-      <main id="main" role="tabpanel" aria-labelledby={`tab-${activeTab}`}>
-        {activeTab === 'inference' && <InferenceTab />}
-        {activeTab === 'fleet' && <FleetTab maxBatch={meta?.max_batch_size || 100} />}
-        {activeTab === 'monitoring' && (
-          <MonitoringTab
-            health={health} alerts={alerts} summary={summary} driftHistory={driftHistory}
-            alertFilter={alertFilter} onAlertFilter={setAlertFilter} onResolve={resolveAlert}
-          />
+        {online === false && (
+          <div className="notice notice-error banner" role="status">
+            <Icon name="alert" size={15} />Cannot reach the inference server — retrying every {POLL_MS / 1000}s.
+          </div>
         )}
-        {activeTab === 'autopsy' && <AutopsyTab fingerprint={fingerprint} onProbed={() => void refresh()} />}
-      </main>
 
-      <footer className="footer">
-        <span>xgboost aft survival model{meta?.model_sha256 ? ` · model ${meta.model_sha256.slice(0, 8)}` : ''}{meta?.version ? ` · api v${meta.version}` : ''}</span>
-        <span>predictions are decision support, not a guarantee — always keep backups.</span>
-      </footer>
+        <main id="main" role="tabpanel" aria-labelledby={`tab-${activeTab}`} key={activeTab}>
+          {activeTab === 'inference' && <InferenceTab />}
+          {activeTab === 'fleet' && <FleetTab maxBatch={meta?.max_batch_size || 100} />}
+          {activeTab === 'monitoring' && (
+            <MonitoringTab
+              health={health} alerts={alerts} summary={summary} driftHistory={driftHistory}
+              alertFilter={alertFilter} onAlertFilter={setAlertFilter} onResolve={resolveAlert}
+            />
+          )}
+          {activeTab === 'autopsy' && <AutopsyTab fingerprint={fingerprint} onProbed={() => void refresh()} />}
+        </main>
+
+        <footer className="footer">
+          <span>
+            XGBoost AFT survival model
+            {meta?.model_sha256 ? <> · model <span className="mono">{meta.model_sha256.slice(0, 8)}</span></> : null}
+            {meta?.version ? ` · API v${meta.version}` : ''}
+          </span>
+          <span>Predictions are decision support, not a guarantee. Always keep backups.</span>
+        </footer>
+      </div>
     </div>
   );
 }

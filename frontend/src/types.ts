@@ -138,3 +138,12 @@ export const FEATURE_LABELS: Record<SmartFeature, string> = {
 };
 
 export const RISK_ORDER: Record<RiskLevel, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+
+/** Short display metadata for each SMART attribute (used by the input grid). */
+export const FEATURE_META: Record<SmartFeature, { code: string; name: string; hint: string }> = {
+  smart_5_raw: { code: 'SMART 5', name: 'Reallocated sectors', hint: 'bad sectors remapped to spares' },
+  smart_187_raw: { code: 'SMART 187', name: 'Uncorrectable errors', hint: 'errors ECC could not recover' },
+  smart_188_raw: { code: 'SMART 188', name: 'Command timeouts', hint: 'operations aborted by timeout' },
+  smart_197_raw: { code: 'SMART 197', name: 'Pending sectors', hint: 'unstable, awaiting remap' },
+  smart_198_raw: { code: 'SMART 198', name: 'Offline uncorrectable', hint: 'failed offline surface scan' },
+};
