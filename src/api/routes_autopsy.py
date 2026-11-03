@@ -28,6 +28,28 @@ FEATURE_MAP = {
 _probe_lock = threading.Lock()
 
 
+def _node_depths(trees_df) -> dict[str, int]:
+    """
+    Depth of every node (root = 0), derived from the Yes/No child links.
+    trees_to_dataframe() has no depth column, so it must be computed.
+    """
+    children = {
+        row.ID: (row.Yes, row.No)
+        for row in trees_df.itertuples(index=False)
+        if row.Feature != "Leaf"
+    }
+    depths: dict[str, int] = {}
+    for root in trees_df.loc[trees_df["Node"] == 0, "ID"]:
+        stack = [(root, 0)]
+        while stack:
+            node_id, depth = stack.pop()
+            depths[node_id] = depth
+            for child in children.get(node_id, ()):
+                if isinstance(child, str):
+                    stack.append((child, depth + 1))
+    return depths
+
+
 def run_probe_sweep(state, n_samples: int):
     """Generate LHS probes and rebuild fingerprint, FAISS index and drift baseline."""
     probe_X = lhs_sample(n_samples)
@@ -154,7 +176,8 @@ def get_topology(request: Request):
     n_trees = trees_df["Tree"].nunique()
     total_nodes = len(trees_df)
     total_leaves = len(trees_df[trees_df["Feature"] == "Leaf"])
-    max_depth = int(trees_df["Depth"].max()) if "Depth" in trees_df.columns else None
+    trees_df = trees_df.assign(Depth=trees_df["ID"].map(_node_depths(trees_df)))
+    max_depth = int(trees_df["Depth"].max())
 
     # Feature importance by type
     importance_types = ["gain", "weight", "cover"]
@@ -172,7 +195,7 @@ def get_topology(request: Request):
     for tree_id in sorted(trees_df["Tree"].unique())[:5]:
         tree_nodes = trees_df[trees_df["Tree"] == tree_id]
         tree_leaves = tree_nodes[tree_nodes["Feature"] == "Leaf"]
-        tree_depth = int(tree_nodes["Depth"].max()) if "Depth" in tree_nodes.columns else None
+        tree_depth = int(tree_nodes["Depth"].max())
         tree_summaries.append({
             "tree_id": int(tree_id),
             "n_nodes": len(tree_nodes),
