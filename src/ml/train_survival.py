@@ -1,8 +1,23 @@
+"""
+train_survival.py — XGBoost AFT survival model training
+
+Trains on per-drive aggregates with real time-to-failure bounds, using a
+shuffled, seeded 80/20 split for early stopping. A quality gate refuses to
+export a model trained on too little data, so the continuous-training
+pipeline can never overwrite production weights with a degenerate model.
+"""
 import argparse
-import xgboost as xgb
-import polars as pl
+import sys
 from pathlib import Path
-import json
+
+import numpy as np
+import polars as pl
+import xgboost as xgb
+
+FEATURES = ["smart_5_raw", "smart_187_raw", "smart_188_raw", "smart_197_raw", "smart_198_raw"]
+MIN_DRIVES = 1000
+MIN_FAILURES = 10
+SEED = 42
 
 def compute_real_ttf(df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -50,23 +65,41 @@ def compute_real_ttf(df: pl.DataFrame) -> pl.DataFrame:
 
     return drive_stats
 
-def train_survival_model(data_path: Path, use_gpu: bool):
+def check_data_quality(drive_stats: pl.DataFrame, min_drives: int, min_failures: int) -> None:
+    n_drives = len(drive_stats)
+    n_failed = int(drive_stats["ever_failed"].sum())
+    if n_drives < min_drives or n_failed < min_failures:
+        raise ValueError(
+            f"Quality gate failed: {n_drives} drives / {n_failed} failures "
+            f"(need >= {min_drives} drives and >= {min_failures} failures). Refusing to export."
+        )
+
+
+def shuffled_split(n: int, eval_fraction: float = 0.2, seed: int = SEED):
+    """Seeded random split. group_by() output order is arbitrary, so slicing is not a valid split."""
+    idx = np.random.default_rng(seed).permutation(n)
+    n_eval = max(1, int(n * eval_fraction))
+    return idx[n_eval:], idx[:n_eval]
+
+
+def train_survival_model(data_path: Path, use_gpu: bool, output_path: Path | None = None,
+                         min_drives: int = MIN_DRIVES, min_failures: int = MIN_FAILURES):
     print(f"loading data from {data_path}")
     df = pl.read_parquet(data_path)
 
     print("computing real per-drive TTF from observation dates...")
     drive_stats = compute_real_ttf(df)
-    
-    features = ["smart_5_raw", "smart_187_raw", "smart_188_raw", "smart_197_raw", "smart_198_raw"]
-    X = drive_stats.select(features).to_pandas().values
-    y_lower = drive_stats.select("y_lower").to_pandas()["y_lower"].values
-    y_upper = drive_stats.select("y_upper").to_pandas()["y_upper"].values
+    check_data_quality(drive_stats, min_drives, min_failures)
 
-    # 80/20 train/eval split for early stopping
-    split = int(len(X) * 0.8)
-    X_train, X_eval = X[:split], X[split:]
-    y_lower_train, y_lower_eval = y_lower[:split], y_lower[split:]
-    y_upper_train, y_upper_eval = y_upper[:split], y_upper[split:]
+    X = drive_stats.select(FEATURES).to_numpy()
+    y_lower = drive_stats["y_lower"].to_numpy()
+    y_upper = drive_stats["y_upper"].to_numpy()
+
+    # Shuffled 80/20 train/eval split for early stopping
+    train_idx, eval_idx = shuffled_split(len(X))
+    X_train, X_eval = X[train_idx], X[eval_idx]
+    y_lower_train, y_lower_eval = y_lower[train_idx], y_lower[eval_idx]
+    y_upper_train, y_upper_eval = y_upper[train_idx], y_upper[eval_idx]
 
     dtrain = xgb.DMatrix(X_train)
     dtrain.set_float_info('label_lower_bound', y_lower_train)
@@ -84,7 +117,8 @@ def train_survival_model(data_path: Path, use_gpu: bool):
         'tree_method': 'hist',
         'learning_rate': 0.05,
         'max_depth': 6,
-        'subsample': 0.8
+        'subsample': 0.8,
+        'seed': SEED,
     }
     
     if use_gpu:
@@ -100,26 +134,36 @@ def train_survival_model(data_path: Path, use_gpu: bool):
         verbose_eval=50
     )
     
-    project_root = data_path.parent.parent.parent
-    api_dir = project_root / "src" / "api"
-    model_path = api_dir / "survival_model.json"
-    
-    print(f"Exporting XGBoost model to {model_path}...")
-    try:
-        bst.save_model(model_path)
-        print("Model saved successfully.")
-    except Exception as e:
-        print(f"Model export failed: {e}")
+    if output_path is None:
+        project_root = data_path.parent.parent.parent
+        output_path = project_root / "src" / "api" / "survival_model.json"
+
+    # Write to a temp file then atomically replace, so a crash mid-write can
+    # never leave a truncated model where the API will load it.
+    print(f"Exporting XGBoost model to {output_path}...")
+    tmp_path = output_path.with_name(output_path.name + ".tmp.json")
+    bst.save_model(tmp_path)
+    tmp_path.replace(output_path)
+    print("Model saved successfully.")
+    return bst
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cpu", action="store_true", help="Force CPU training")
+    parser.add_argument("--min-drives", type=int, default=MIN_DRIVES)
+    parser.add_argument("--min-failures", type=int, default=MIN_FAILURES)
     args = parser.parse_args()
-    
+
     project_root = Path(__file__).resolve().parent.parent.parent
     data_path = project_root / "data" / "processed" / "survival_data.parquet"
-    
-    train_survival_model(data_path, use_gpu=not args.cpu)
+
+    try:
+        train_survival_model(data_path, use_gpu=not args.cpu,
+                             min_drives=args.min_drives, min_failures=args.min_failures)
+    except Exception as e:
+        print(f"Training failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

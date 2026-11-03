@@ -1,12 +1,30 @@
-import os
-import glob
+"""
+extract_columns.py — compile the "Failure Five" SMART columns from a folder of
+Backblaze daily CSVs into a single CSV (pure stdlib, low memory).
+
+Usage:
+  python extract_columns.py --input-dir ~/Downloads/data_Q4_2025 \
+                            --output compiled_smart_data.csv
+"""
+import argparse
 import csv
+import glob
+import os
 import time
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input-dir", required=True, help="Folder containing Backblaze daily CSV files")
+    parser.add_argument("--output", default="compiled_smart_data.csv", help="Output CSV path")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     start_time = time.time()
-    input_dir = '/Users/omkhatri/Downloads/data_Q4_2025'
-    output_file = '/Users/omkhatri/DataGuardian/data-center-guardian/compiled_smart_data.csv'
+    input_dir = os.path.expanduser(args.input_dir)
+    output_file = os.path.expanduser(args.output)
 
     target_columns = [
         'date',
