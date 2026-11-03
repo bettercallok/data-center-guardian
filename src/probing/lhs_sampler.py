@@ -72,6 +72,37 @@ def lhs_sample(n_samples: int, random_seed: int = 42) -> np.ndarray:
     return scaled
 
 
+def zero_inflated_sample(n_samples: int, random_seed: int = 7, zero_prob: float = 0.5) -> np.ndarray:
+    """
+    Realistic-prior probe samples for SMART counters.
+
+    Real SMART error counters are zero-inflated and heavy-tailed: most healthy
+    drives report exactly 0, and non-zero values cluster at small counts.
+    Uniform LHS almost never lands near the all-zero corner, so a novelty index
+    built on it alone flags perfectly healthy drives as "novel". These samples
+    use log-scaled LHS strata (dense near 0) and zero each feature
+    independently with probability `zero_prob`.
+    """
+    rng = np.random.RandomState(random_seed)
+    maxes = np.array([hi for _, hi in SMART_FEATURE_RANGES.values()], dtype=np.float64)
+    unit = lhs_sample(n_samples, random_seed=random_seed) / maxes
+    X = np.floor(np.expm1(unit * np.log1p(maxes)))
+    X[rng.uniform(size=X.shape) < zero_prob] = 0.0
+    return X.astype(np.float32)
+
+
+def novelty_probe_sample(n_samples: int, random_seed: int = 42) -> np.ndarray:
+    """
+    Probe set for the latent-space novelty index: half uniform LHS (full
+    operating envelope) and half zero-inflated samples (realistic healthy fleet).
+    """
+    n_uniform = n_samples // 2
+    return np.vstack([
+        lhs_sample(n_uniform, random_seed=random_seed),
+        zero_inflated_sample(n_samples - n_uniform, random_seed=random_seed + 1),
+    ])
+
+
 def get_feature_stats(probe_X: np.ndarray) -> dict:
     """
     Return descriptive statistics for the probe distribution.
